@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="0" y="0" width="1024" height="1024" fill="#d90f47"/>
+  <path d="M512 326V150" stroke="#fe2c55" stroke-width="54" stroke-linecap="round"/><circle cx="512" cy="150" r="72" fill="#fe2c55"/><circle cx="488" cy="126" r="21.599999999999998" fill="#fff" fill-opacity=".75"/>
+  <ellipse cx="512" cy="806" rx="760" ry="520" fill="#fe2c55"/><rect x="-248" y="806" width="1520" height="1200" fill="#fe2c55"/>
+  <ellipse cx="156.8" cy="746.3199999999999" rx="81.92" ry="48.64" fill="#ff7f9d"/><ellipse cx="867.2" cy="746.3199999999999" rx="81.92" ry="48.64" fill="#ff7f9d"/>
+  <ellipse cx="272" cy="556" rx="128" ry="156" fill="#4c0519"/><circle cx="315.52" cy="496.72" r="43.52" fill="#fff"/><circle cx="225.92000000000002" cy="621.52" r="12.8" fill="#fff"/><ellipse cx="752" cy="556" rx="128" ry="156" fill="#4c0519"/><circle cx="795.52" cy="496.72" r="43.52" fill="#fff"/><circle cx="705.92" cy="621.52" r="12.8" fill="#fff"/>
+  <path d="M420 678H604Q630 678 630 704C630 777.36 578.08 816 512 816C445.91999999999996 816 394 777.36 394 704Q394 678 420 678Z" fill="#4c0519"/><clipPath id="mouthClip"><path d="M420 678H604Q630 678 630 704C630 777.36 578.08 816 512 816C445.91999999999996 816 394 777.36 394 704Q394 678 420 678Z"/></clipPath><ellipse clip-path="url(#mouthClip)" cx="512" cy="822" rx="70.8" ry="57.96" fill="#ff7a98"/>
+</svg>
