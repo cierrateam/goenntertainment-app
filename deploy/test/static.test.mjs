@@ -1178,7 +1178,12 @@ EOF
 chmod 755 /usr/local/bin/sleep /usr/local/bin/mysqladmin /usr/local/bin/mysqldump /usr/local/bin/tar
 export BACKUP_RETENTION_DAYS=7 DB_HOST=db DB_DATABASE=d DB_USERNAME=u DB_PASSWORD=stand-in-not-a-secret TAR_MODE= DB_UP_AFTER=0
 once() {
-  rm -rf /backups/* /backups/.[!.]* /work/sleeps /work/pings /work/dumps /data/uploads/added-while-archiving
+  rm -rf /backups/* /backups/.[!.]*
+  run "$1"
+}
+# run <name>: one run on the sets already in /backups (plant puts them there), and what happened.
+run() {
+  rm -f /work/sleeps /work/pings /work/dumps /data/uploads/added-while-archiving
   echo 0 > /work/clock
   out=$(bash /opt/deploy/backup.sh --once 2>&1); code=$?
   printf '=== %s exit %s\n%s\n' "$1" "$code" "$out"
@@ -1190,6 +1195,19 @@ once() {
   latest=$(ls /backups | grep '^uploads-' | tail -n 1)
   echo "sets: $(ls /backups | grep -c '^uploads-')"
   echo "archived files: $(if [ -n "$latest" ]; then /usr/bin/tar -tzf "/backups/$latest" | grep -c -v '/$'; else echo none; fi)"
+  # Every stamp left, oldest first, with how many of its three files are there.
+  echo "left: $(ls /backups | sed -n -E 's/^(db-|uploads-|SHA256SUMS-)([0-9]{8}T[0-9]{6}Z).*$/\2/p' | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')"
+}
+# plant <age in minutes> [<age of its SHA256SUMS file>]: a set as a run that long ago left it, its
+# stamp from that time, on an empty or planted /backups (fresh empties it). Prints the stamp.
+fresh() { rm -rf /backups/* /backups/.[!.]*; }
+plant() {
+  sums=$1; [ "$#" -ge 2 ] && sums=$2
+  now=$(date -u +%s); t=$(( now - $1 * 60 )); u=$(( now - sums * 60 ))
+  stamp=$(date -u -d "@$t" +%Y%m%dT%H%M%SZ)
+  for f in "db-$stamp.sql.gz" "uploads-$stamp.tar.gz"; do echo planted > "/backups/$f"; touch -d "@$t" "/backups/$f"; done
+  echo planted > "/backups/SHA256SUMS-$stamp"; touch -d "@$u" "/backups/SHA256SUMS-$stamp"
+  echo "$stamp"
 }
 `;
 
@@ -1255,6 +1273,64 @@ test('F-17: the backup waits for the database without credentials and for a boun
     const args = r['ping arguments'];
     assert.equal(args, 'ping -h db -P 3306 --connect-timeout=5 --silent |', `${name}: mysqladmin arguments`);
   }
+});
+
+test("F-17: prune keeps the newest BACKUP_RETENTION_DAYS sets whatever their age, deletes the older ones by age as before, a set's files together, and nothing after a failed run", () => {
+  // BACKUP_STAND_INS runs with BACKUP_RETENTION_DAYS=7. Ages in minutes, oldest set first; a pair
+  // is [the age of db- and uploads-, the age of SHA256SUMS-].
+  const DAY = 1440;
+  const RETENTION = 7;
+  const ages = {
+    // A server restored from a restore point older than the retention: every set it holds is old.
+    restore: [20, 19, 18, 17, 16, 15, 14, 13, 12].map((d) => d * DAY),
+    // One set a night.
+    normal: [9.5, 8.5, 7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5].map((d) => d * DAY),
+    // Beyond the newest sets: one set all old, two whose files lie on both sides of the limit.
+    together: [8 * DAY, [7 * DAY + 120, 7 * DAY - 120], [7 * DAY - 120, 7 * DAY + 120], 360, 300, 240, 180, 120, 60],
+    // More old sets than the retention, then a run that fails.
+    failed: [19, 18, 17, 16, 15, 14, 13, 12, 11, 10].map((d) => d * DAY),
+  };
+  const planting = (list) => `fresh; p=''; ${list.map((a) => `p="$p $(plant ${[a].flat().join(' ')})"`).join('; ')}`;
+  const runs = backupCases([
+    `${planting(ages.restore)}; run restore; echo "planted:$p"`,
+    `${planting(ages.normal)}; run normal; echo "planted:$p"`,
+    `${planting(ages.together)}; run together; echo "planted:$p"`,
+    `${planting(ages.failed)}; export TAR_MODE=broken; run failed; echo "planted:$p"; export TAR_MODE=`,
+  ]);
+  assert.deepEqual(Object.keys(runs), ['restore', 'normal', 'together', 'failed']);
+  const planted = (r) => String(r.planted ?? '').trim().split(/\s+/).filter(Boolean);
+  // { stamp: how many of its three files are left }
+  const left = (r) => Object.fromEntries(String(r.left ?? '').trim().split(/\s+/).filter(Boolean).map((e) => e.split(':')).map(([s, n]) => [s, Number(n)]));
+  const written = (r) => Object.keys(left(r)).filter((s) => !planted(r).includes(s));
+  console.log(`prune: ${Object.entries(runs).map(([n, r]) => `${n}: exit ${r.code}, ${planted(r).length} planted, ${Object.keys(left(r)).length} left`).join('; ')}`);
+  for (const [name, r] of Object.entries(runs)) {
+    assert.equal(planted(r).length, ages[name].length, `${name}: planting failed`);
+    assert.deepEqual(Object.entries(left(r)).filter(([, n]) => n !== 3).map(([s, n]) => `${s}: ${n} of 3 files`), [], `${name}: a set was split`);
+  }
+
+  // The restore case: every planted set is older than the retention, and the newest of them stay
+  // with the run's own new set, which makes up the newest RETENTION.
+  const { restore, normal, together, failed } = runs;
+  assert.equal(restore.code, 0, restore.out);
+  assert.equal(written(restore).length, 1, 'restore: the run did not write one set');
+  assert.deepEqual(Object.keys(left(restore)).sort(), [...planted(restore).slice(-(RETENTION - 1)), ...written(restore)].sort(), 'restore: not the newest sets kept');
+  assert.match(restore.out, /^backup: pruned 9 file\(s\)/m);
+
+  // The normal case, as before: the sets older than the retention go, the younger ones stay.
+  assert.equal(normal.code, 0, normal.out);
+  const young = planted(normal).filter((s, i) => ages.normal[i] <= RETENTION * DAY);
+  assert.deepEqual(Object.keys(left(normal)).sort(), [...young, ...written(normal)].sort(), 'normal: not what deleting by age leaves');
+  assert.match(normal.out, /^backup: pruned 9 file\(s\)/m);
+
+  // A set goes only when all its files are old, and then with all three.
+  assert.equal(together.code, 0, together.out);
+  assert.deepEqual(Object.keys(left(together)).sort(), [...planted(together).slice(1), ...written(together)].sort(), 'together: a set whose files lie on both sides of the limit was deleted, or the old set was kept');
+  assert.match(together.out, /^backup: pruned 3 file\(s\)/m);
+
+  // A failed run deletes nothing, however old the sets.
+  assert.notEqual(failed.code, 0, 'failed: the run passed');
+  assert.deepEqual(Object.keys(left(failed)).sort(), [...planted(failed)].sort(), 'failed: a set was deleted');
+  assert.ok(failed.out.includes('nothing was deleted'), `failed:\n${failed.out}`);
 });
 
 test('settings checked in two places use the same patterns (preflight and the services)', () => {

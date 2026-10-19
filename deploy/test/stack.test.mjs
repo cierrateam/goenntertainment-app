@@ -937,20 +937,31 @@ check('F-17: the backup writes a database dump and an archive of the uploads and
   }
 });
 
-check('F-17: pruning deletes only expired sets, and only after a successful run', async () => {
+check('F-17: pruning keeps the newest BACKUP_RETENTION_DAYS sets whatever their age, deletes the older expired ones, and only after a successful run', async () => {
   const days = Number(values.BACKUP_RETENTION_DAYS);
   assert.ok(days >= 1, 'BACKUP_RETENTION_DAYS');
   const now = Math.floor(Date.now() / 1000);
   const set = (stamp) => [`db-${stamp}.sql.gz`, `uploads-${stamp}.tar.gz`, `SHA256SUMS-${stamp}`];
-  const old = set('19990101T000000Z');
+  const list = () => stack.exec('backup', ['ls', '-1', '/backups']).stdout.split(/\s+/).filter(Boolean);
+  // The sets the runs so far wrote (the run at start, the check above) and the good run's own
+  // below are the newest. Planted sets with older stamps (1999) fill up the newest
+  // BACKUP_RETENTION_DAYS: one of them expired, kept by its place, the others young. Beyond them,
+  // one set inside the retention, kept by its age, and one expired set, deleted.
+  const written = list().filter((f) => /^SHA256SUMS-\d{8}T\d{6}Z$/.test(f)).length;
+  const fillers = days - (written + 1) - 1;
+  assert.ok(fillers >= 0, `${written} sets exist already: this check needs fewer than ${days - 1}`);
+  const keptOld = set('19990301T000000Z');
+  const filler = Array.from({ length: fillers }, (_, i) => set(`199902${String(i + 1).padStart(2, '0')}T000000Z`)).flat();
   const recent = set('19990102T000000Z');
+  const old = set('19990101T000000Z');
+  const planted = [...keptOld, ...filler, ...recent, ...old];
   const touch = stack.sh('backup', [
-    `cd /backups && touch ${[...old, ...recent].join(' ')}`,
-    `touch -d @${now - (days + 3) * 86400} ${old.join(' ')}`,
+    `cd /backups && touch ${planted.join(' ')}`,
+    `touch -d @${now - (days + 3) * 86400} ${[...keptOld, ...old].join(' ')}`,
     `touch -d @${now - 2 * 86400} ${recent.join(' ')}`,
+    ...(filler.length > 0 ? [`touch -d @${now - 86400} ${filler.join(' ')}`] : []),
   ].join(' && '));
   assert.equal(touch.status, 0, touch.stderr);
-  const list = () => stack.exec('backup', ['ls', '-1', '/backups']).stdout.split(/\s+/).filter(Boolean);
   const pause = () => new Promise((r) => setTimeout(r, 1100));
   try {
     await pause();
@@ -962,18 +973,20 @@ check('F-17: pruning deletes only expired sets, and only after a successful run'
     const afterSuccess = list();
     const checkAfterSuccess = stack.exec('backup', ['bash', '/opt/deploy/backup.sh', '--check']).status;
     const stamp = /run (\S+) written/.exec(ok.stdout)?.[1];
-    console.log(`prune (retention ${days} days): failed run exit ${failed.status}, --check ${checkAfterFailure}; good run exit ${ok.status}, --check ${checkAfterSuccess}; ${/pruned \d+ file\(s\)[^\n]*/.exec(ok.stdout)?.[0]}`);
+    console.log(`prune (retention ${days} days, ${written} sets written before, ${planted.length / 3} planted): failed run exit ${failed.status}, --check ${checkAfterFailure}; good run exit ${ok.status}, --check ${checkAfterSuccess}; ${/pruned \d+ file\(s\)[^\n]*/.exec(ok.stdout)?.[0]}`);
     assert.notEqual(failed.status, 0, 'a run with a wrong password succeeded');
-    assert.deepEqual([...old, ...recent].filter((f) => !afterFailure.includes(f)), [], 'a failed run deleted files');
+    assert.deepEqual(planted.filter((f) => !afterFailure.includes(f)), [], 'a failed run deleted files');
     assert.equal(checkAfterFailure, 1, '--check after a failed run');
     assert.equal(ok.status, 0, tail(ok.stdout + ok.stderr));
-    assert.deepEqual(old.filter((f) => afterSuccess.includes(f)), [], 'expired files were kept');
-    assert.deepEqual(recent.filter((f) => !afterSuccess.includes(f)), [], 'files inside the retention were deleted');
+    assert.deepEqual(old.filter((f) => afterSuccess.includes(f)), [], 'an expired set beyond the newest was kept');
+    assert.deepEqual(recent.filter((f) => !afterSuccess.includes(f)), [], 'a set inside the retention was deleted');
+    assert.deepEqual(keptOld.filter((f) => !afterSuccess.includes(f)), [], `an expired set among the newest ${days} was deleted`);
+    assert.deepEqual(filler.filter((f) => !afterSuccess.includes(f)), [], 'a young set was deleted');
     assert.deepEqual(set(stamp).filter((f) => !afterSuccess.includes(f)), [], 'the new set is missing');
     assert.match(ok.stdout, new RegExp(`pruned ${old.length} file\\(s\\)`));
     assert.equal(checkAfterSuccess, 0, '--check after a good run');
   } finally {
-    stack.sh('backup', `cd /backups && rm -f ${[...old, ...recent].join(' ')}`);
+    stack.sh('backup', `cd /backups && rm -f ${planted.join(' ')}`);
   }
 });
 

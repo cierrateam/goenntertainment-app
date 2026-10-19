@@ -134,11 +134,13 @@ The mobile app is not a container: it is built with EAS and carries the server a
   `graph.microsoft.com` and the server's metadata endpoint,
   [Mail through Microsoft Graph](#mail-through-microsoft-graph); with `smtp`: the provider), and
   the image builds to the container registries and package mirrors. caddy calls out to nothing.
-- **The metadata endpoint**: the platform drops all container traffic to `169.254.169.254` (a
-  rule at the end of Docker's `DOCKER-USER` chain, applied again after every reboot and every
+- **The metadata endpoint and the WireServer**: the platform drops all container traffic to
+  `169.254.169.254`, and to `168.63.129.16` (the WireServer) all but DNS on port 53, udp and tcp
+  (rules at the end of Docker's `DOCKER-USER` chain, applied again after every reboot and every
   Docker restart), and the server has the user-assigned managed identity attached
   ([Mail through Microsoft Graph](#mail-through-microsoft-graph)). The app lets api and the
-  scheduler through, and no other container (step 3 of [First start](#first-start)).
+  scheduler through to the metadata endpoint, and no other container (step 3 of
+  [First start](#first-start)).
 - **The origin certificate files** in `<ORIGIN_TLS_DIR>`
   ([Origin certificate and Authenticated Origin Pulls](#origin-certificate-and-authenticated-origin-pulls)).
 - A **password manager** for the generated secrets and `APP_KEY` (below).
@@ -201,7 +203,7 @@ missing one. `deploy/.env.example` carries the same list with longer comments.
 | `MAIL_PASSWORD` | with `smtp`: the SMTP password | `______` (the operator) | must be in the file; empty with `graph`, or for a relay without login |
 | `MAIL_FROM_ADDRESS` | the sender address of every mail; with `graph`, the mailbox the identity may send as | `______` (the operator: the sender mailbox) | an e-mail address |
 | `BACKUP_DIR` | the host folder the backup service writes to | `______` (the operator: where, who looks after it) | an absolute path outside the clone, owned by root, mode 700 |
-| `BACKUP_RETENTION_DAYS` | days a backup set is kept | `______` (the operator, with whoever answers for data protection) | whole days, at least 1 |
+| `BACKUP_RETENTION_DAYS` | days a backup set is kept; the newest that many sets stay whatever their age | `______` (the operator, with whoever answers for data protection) | whole days, at least 1 |
 | `LOG_MAX_SIZE` | the size of one container log file | `______` (the operator, with whoever answers for data protection) | a whole number with the unit `k`, `m` or `g` |
 | `LOG_MAX_FILES` | how many log files each container keeps | `______` (the operator, with whoever answers for data protection) | a whole number, at least 2 (Docker's `local` log driver compresses the rotated files and refuses a single file) |
 | `MYSQL_BINLOG_RETENTION_DAYS` | days MySQL keeps its binary log, which records every change, also the rows of deleted accounts; the log is rotated daily, so a change stays at most two days longer ([Logs](#logs)) | `______` (the operator, with whoever answers for data protection) | whole days from 1 to 9999, or `off` (no binary log); 0 is refused |
@@ -289,9 +291,10 @@ What the hosting platform provides:
 - the user-assigned managed identity, attached to the server: its client ID goes into
   `MAIL_GRAPH_CLIENT_ID`, its principal ID is needed once, below;
 - outbound HTTPS to `graph.microsoft.com` for api and the scheduler;
-- the rule that drops all container traffic to the metadata endpoint
-  ([Prerequisites](#prerequisites)); the app lets api and the scheduler, and no other container,
-  past it (step 3 of [First start](#first-start)).
+- the rules that drop all container traffic to the metadata endpoint, and to the WireServer
+  (`168.63.129.16`) all but DNS on port 53 ([Prerequisites](#prerequisites)); the app lets api
+  and the scheduler, and no other container, past the first (step 3 of
+  [First start](#first-start)).
 
 What Microsoft 365 must provide (an Exchange administrator does it; no tenant values belong in
 this repository):
@@ -456,17 +459,21 @@ shows up at once as Cloudflare's error 525, not as a lock that silently stays op
     noanswer caddy docker compose exec -T caddy wget -q -T 5 -O /dev/null --header 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
     noanswer edge docker run --rm --network deploy_edge --entrypoint wget "$(docker compose images -q caddy)" -q -T 5 -O /dev/null --header 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
     noanswer outbound docker run --rm --network deploy_outbound --entrypoint wget "$(docker compose images -q caddy)" -q -T 5 -O /dev/null --header 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
+    noanswer wireserver docker compose exec -T caddy wget -q -T 5 -O /dev/null 'http://168.63.129.16/?comp=versions'
     iptables -S DOCKER-USER
     ```
 
     Expected: `HTTP/1.1 200 OK` from api and from the scheduler; `caddy: no answer`, `edge: no
-    answer` and `outbound: no answer`; and the two rules of step 3 above the platform's drop. A
-    line with `STOP` means that the endpoint answered there, or that the check did not run, and it
-    ends with wget's or Docker's own message: `exit 0` without a message is a 200, `server returned
-    error` any other status, anything else a command that failed (a wrong network name, say). Do
-    not go on until all three say `no answer`. After the reboot, the same; a missing rule means
-    the unit did not run: `systemctl status goenn-metadata-access.service`. Then send a test
-    mail: a password reset for a test account.
+    answer` and `outbound: no answer`; `wireserver: no answer` (the WireServer answers
+    `?comp=versions` with 200, without any header, wherever it is reachable); and the two rules
+    of step 3 above the platform's drop. A line with `STOP` means that the endpoint answered
+    there, or that the check did not run, and it ends with wget's or Docker's own message: `exit
+    0` without a message is a 200, `server returned error` any other status, anything else a
+    command that failed (a wrong network name, say). Do not go on until all four say `no answer`.
+    After the reboot, the same; a missing rule means the unit did not run: `systemctl status
+    goenn-metadata-access.service`. Then send a test mail: a password reset for a test account.
+    It also proves that the containers still have DNS (port 53 at the WireServer, which the
+    platform leaves open): api has to resolve `graph.microsoft.com` to send it.
 
 11. Confirm the first backup: `docker compose logs backup` shows `run ... written`, and
     `ls -l <BACKUP_DIR>` lists one `db-`, `uploads-` and `SHA256SUMS-` file.
@@ -614,16 +621,31 @@ whenever the service starts:
   while the uploads are archived: when files were added or removed meanwhile, the log says so and
   the set is kept (the archive holds the files as they were found); any other archive error fails
   the run.
-- **Retention**: after each successful run, sets older than `BACKUP_RETENTION_DAYS` are deleted. A
-  failed run deletes nothing.
-- **Time**: 02:30 UTC is a technical constant (`RUN_AT_UTC` in `deploy/scripts/backup.sh`); another
-  time: `______` (the operator).
-- **Not in the backup**: `deploy/.env` and the secrets (keep `APP_KEY` and the secrets in the
+- **Retention**: after each successful run, the sets older than `BACKUP_RETENTION_DAYS` days are
+  deleted, but never the newest `BACKUP_RETENTION_DAYS` sets (by the stamp in their names),
+  whatever their age; a set's three files go or stay together. With one set a night that is the
+  same as deleting by age. After a restore of an old restore point, the run at start keeps the
+  newest of the sets the restore point holds, the one written on its night included. A failed run
+  deletes nothing.
+- **Time**: 02:30 UTC is a technical constant (`RUN_AT_UTC` in `deploy/scripts/backup.sh`). The
+  set written then is the consistent copy of the database inside every restore point of the
+  platform; the database files a restore point holds are crash-consistent at best. Another time
+  must still finish, on the server's disk, before the restore point at 03:30 UTC: `______` (the
+  operator).
+- **Not in the sets**: `deploy/.env` and the secrets (keep `APP_KEY` and the secrets in the
   password manager), the files in `<ORIGIN_TLS_DIR>` (keep the key in the password manager;
   Cloudflare can issue a new origin certificate), the container logs, and MySQL's binary log, so a
-  restore goes back to the last set, not to a point in time between two sets.
-- **Offsite copy, encryption at rest, who looks after the backups and tests a restore**: `______`
-  (the operator). Without an offsite copy, losing the server loses the backups too.
+  restore of a set goes back to that set, not to a point in time between two sets.
+- **Offsite copy**: the hosting platform's restore point at 03:30 UTC every night: the whole
+  server, agentless and crash-consistent, kept for 30 days in a geo-redundant Recovery Services
+  vault, which encrypts it at rest. A restore point holds the whole disk: `deploy/.env` (`APP_KEY`,
+  the database passwords), the origin key, the container logs and the sets. Whoever may restore
+  from the vault can read them. Who looks after the backups and tests a restore: `______` (the
+  operator).
+- **Deleted data**: personal data deleted in the app can remain for up to `BACKUP_RETENTION_DAYS`
+  days plus 30 (the sets inside the restore points), and longer after the server was down, since
+  the newest sets are kept whatever their age. What the privacy text says about it is a decision
+  of its own ([Decisions this runbook does not make](#decisions-this-runbook-does-not-make)).
 
 Checking:
 
@@ -639,7 +661,7 @@ docker compose exec backup bash /opt/deploy/backup.sh --check    # the healthche
 
 A restore replaces the database and both upload volumes with one set. `<SET_DIR>` is the folder
 that holds the set: `<BACKUP_DIR>` on the same server. On a new server, put the set into a folder
-of its own, not into the new `<BACKUP_DIR>`: the backup service deletes sets there by age.
+of its own, not into the new `<BACKUP_DIR>`: the backup service deletes old sets there.
 
 1. Pick the set and check it:
 
@@ -699,6 +721,29 @@ of its own, not into the new `<BACKUP_DIR>`: the backup service deletes sets the
    The gate passes with the restored admin account; api runs the migrations at start; the backup
    service writes a first set of the restored state.
 
+### After losing the server
+
+The platform restores the whole server from a restore point. It comes back with every service
+running, caddy and backup included: the app serves the database as the restore point caught it,
+and the backup service makes its run at start.
+
+1. At once, stop the services that write (step 2 of [Restore](#restore)):
+
+   ```bash
+   docker compose stop caddy api scheduler backup
+   ```
+
+2. Pick the set as in step 1 of [Restore](#restore), with `<BACKUP_DIR>` as `<SET_DIR>`, by its
+   stamp: the one written at 02:30 UTC on the night of the restore point, not the newest file.
+   The run at start may have written a newer one, from the database as the restore point caught
+   it.
+3. Then steps 3 to 5 of [Restore](#restore).
+
+If db does not become healthy, copy that set to a folder of its own, remove the database volume
+(`docker compose down`, then `docker volume rm deploy_db-data`) and restore as onto a fresh
+server ([First start](#first-start), "Restoring onto a fresh server instead"), with the copy as
+`<SET_DIR>`.
+
 ## Logs
 
 Every container logs to Docker's `local` log driver, rotated by size: at most `LOG_MAX_FILES`
@@ -730,8 +775,9 @@ binary-log file only when the log rotates, once the file's last write is more th
 `MYSQL_BINLOG_RETENTION_DAYS` days old. The db service turns on MySQL's event scheduler, and an
 event (`deploy/mysql/02-binlog-rotate.sql`, created as root on the first start of an empty volume)
 rotates the log once a day. So a change, including the rows of a deleted account, stays in the
-binary log at least `MYSQL_BINLOG_RETENTION_DAYS` days and at most two days longer; the backups
-keep their own copy for `BACKUP_RETENTION_DAYS` days. To see the values in effect and the event:
+binary log at least `MYSQL_BINLOG_RETENTION_DAYS` days and at most two days longer; the backup
+sets keep their own copy for `BACKUP_RETENTION_DAYS` days, and the platform's restore points 30
+days longer ([Backups](#backups)). To see the values in effect and the event:
 
 ```bash
 docker compose exec db sh -c 'MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -uroot -N -e "SELECT @@log_bin, @@binlog_expire_logs_seconds, @@event_scheduler; SELECT EVENT_NAME, STATUS, INTERVAL_VALUE, INTERVAL_FIELD, LAST_EXECUTED FROM information_schema.EVENTS"'
@@ -825,11 +871,12 @@ row are required: the stack does not start without them.
 | how mail goes out (`MAIL_MAILER`: Microsoft Graph or SMTP), the sender mailbox (`MAIL_FROM_ADDRESS`), and with SMTP the provider (`MAIL_HOST`, `MAIL_USERNAME`, `MAIL_PASSWORD`) | the operator | `______` |
 | whether the server takes payments in test mode, without real money (`PAYMENTS_MODE`) | the operator, with whoever answers for the business | `______` |
 | retention of evidence images and expired sign-in data (`EVIDENCE_RETENTION_DAYS`, `TOKEN_RETENTION_DAYS`) | the operator, with whoever answers for data protection | `______` |
-| where the backups live, who looks after them, the offsite copy, encryption at rest, and how long sets are kept (`BACKUP_DIR`, `BACKUP_RETENTION_DAYS`) | the operator, with whoever answers for data protection | `______` |
+| where the backups live, who looks after them and tests a restore, and how long sets are kept (`BACKUP_DIR`, `BACKUP_RETENTION_DAYS`) | the operator, with whoever answers for data protection | `______` |
+| what the privacy text says about personal data deleted in the app that remains in the backup sets and the platform's restore points (up to `BACKUP_RETENTION_DAYS` days plus 30, longer after the server was down) | the operator | `______` |
 | how much container log is kept, whether a time limit is required (`LOG_MAX_SIZE`, `LOG_MAX_FILES`) | the operator, with whoever answers for data protection | `______` |
 | how long MySQL keeps its binary log, or `off` (`MYSQL_BINLOG_RETENTION_DAYS`) | the operator, with whoever answers for data protection | `______` |
 | whether the access log masks client addresses or query strings; who may read production logs | the operator, with whoever answers for data protection | `______` |
-| the backup time (02:30 UTC is a technical constant) | the operator | `______` |
+| the backup time (02:30 UTC is a technical constant; another time must finish before the restore point at 03:30 UTC) | the operator | `______` |
 | who the admin is (the address typed in at the first start), how many admin accounts there are, and who approves an admin grant | whoever is accountable for the app, to be named before go-live | `______` |
 | the access-token lifetime (default 30 days, `SANCTUM_EXPIRATION`) | the operator | `______` |
 | who makes and renews the origin certificate and Cierra's origin-pull CA and client certificate, and tracks their expiry dates | the operator | `______` |
