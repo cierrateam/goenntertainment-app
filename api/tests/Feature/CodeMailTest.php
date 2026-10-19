@@ -3,10 +3,14 @@
 namespace Tests\Feature;
 
 use App\Support\TwoFactor;
+use Illuminate\Http\Client\Request;
 use Illuminate\Log\Events\MessageLogged;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Mail;
 use RuntimeException;
+use Symfony\Component\Mailer\Exception\TransportException;
 use Tests\AppFeatureTestCase;
 
 /**
@@ -17,10 +21,14 @@ use Tests\AppFeatureTestCase;
  * the log names the exception class.
  *
  * The real mail manager runs here (no Mail::fake), so the transport that would send is the one
- * the configuration picks.
+ * the configuration picks. With the graph mailer, Laravel's HTTP client is faked: no request
+ * leaves the test.
  */
 class CodeMailTest extends AppFeatureTestCase
 {
+    /** The graph mailer's sender mailbox. */
+    private const GRAPH_SENDER = 'sender@example.invalid';
+
     /** @var list<array{level: string, text: string}> */
     private array $logged = [];
 
@@ -158,5 +166,77 @@ class CodeMailTest extends AppFeatureTestCase
         $this->assertNoMailInTheLog();
         $this->assertRefusalLogged('[two-factor] Code-Mail nicht versendet');
         $this->assertCount(0, app('mail.manager')->mailer('array')->getSymfonyTransport()->messages());
+    }
+
+    /**
+     * The graph mailer (App\Mail\GraphTransport) with a faked metadata endpoint and Graph: no
+     * request leaves the test. Graph answers $status to sendMail.
+     */
+    private function useGraph(int $status = 202): void
+    {
+        config([
+            'mail.default' => 'graph',
+            'mail.mailers.graph' => ['transport' => 'graph', 'client_id' => '00000000-0000-4000-8000-00000000000b'],
+            'mail.from.address' => self::GRAPH_SENDER,
+        ]);
+        Mail::forgetMailers();
+        Http::preventStrayRequests();
+        Http::fake([
+            'http://169.254.169.254/*' => Http::response(['access_token' => 'fake-codemail-token-not-a-secret', 'expires_in' => '3599', 'token_type' => 'Bearer']),
+            'https://graph.microsoft.com/*' => Http::response($status === 202 ? '' : ['error' => ['code' => 'ErrorAccessDenied', 'message' => 'refused']], $status),
+        ]);
+    }
+
+    public function test_a_reset_code_mail_goes_out_through_microsoft_graph(): void
+    {
+        $this->useGraph();
+        $user = $this->makeUser();
+
+        $this->postJson('/api/forgot-password', ['email' => $user->email])->assertOk();
+
+        Http::assertSent(fn (Request $request) => $request->url() === 'https://graph.microsoft.com/v1.0/users/'.self::GRAPH_SENDER.'/sendMail'
+            && ($request->data()['message']['toRecipients'][0]['emailAddress']['address'] ?? null) === $user->email
+            && preg_match('/(?<!\d)\d{6}(?!\d)/', (string) ($request->data()['message']['body']['content'] ?? '')) === 1
+            && ($request->data()['saveToSentItems'] ?? null) === false);
+        $this->assertSame(1, DB::table('two_factor_challenges')->where('user_id', $user->id)->where('purpose', 'reset')->count());
+        $this->assertNoMailInTheLog();
+    }
+
+    public function test_a_failover_chain_of_graph_and_the_log_mailer_is_refused(): void
+    {
+        $this->useGraph();
+        config(['mail.mailers.failover.mailers' => ['graph', 'log'], 'mail.default' => 'failover']);
+        Mail::forgetMailers();
+        $user = $this->makeUser(['two_factor_method' => TwoFactor::METHOD_EMAIL, 'two_factor_confirmed_at' => now()]);
+
+        $this->withBearer($this->issueToken($user))
+            ->postJson('/api/user/two-factor/code')
+            ->assertStatus(503);
+
+        Http::assertNothingSent();
+        $this->assertNoMailInTheLog();
+        $this->assertRefusalLogged('[two-factor] Code-Mail nicht versendet');
+    }
+
+    public function test_a_refused_graph_mail_answers_neutrally_keeps_no_code_and_logs_graphs_code(): void
+    {
+        $this->useGraph(403);
+        $user = $this->makeUser();
+
+        $this->postJson('/api/forgot-password', ['email' => $user->email])
+            ->assertOk()
+            ->assertJsonPath('status', 'sent');
+
+        $this->assertSame(0, DB::table('two_factor_challenges')->where('user_id', $user->id)->where('purpose', 'reset')->count());
+        // The caller logs the exception class (F-38); the transport logs what Graph answered.
+        $caller = array_values(array_filter($this->logged, fn (array $r) => $r['level'] === 'error' && str_contains($r['text'], '[password-reset] code mail not sent')));
+        $this->assertCount(1, $caller);
+        $this->assertStringContainsString(json_encode(TransportException::class), $caller[0]['text']);
+        $graph = array_values(array_filter($this->logged, fn (array $r) => $r['level'] === 'error' && str_contains($r['text'], '[mail-graph] mail not sent')));
+        $this->assertCount(1, $graph);
+        foreach (['"stage":"send"', '"status":403', '"error":"ErrorAccessDenied"'] as $part) {
+            $this->assertStringContainsString($part, $graph[0]['text']);
+        }
+        $this->assertStringNotContainsString($user->email, $graph[0]['text']);
     }
 }

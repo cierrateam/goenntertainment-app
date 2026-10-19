@@ -57,6 +57,8 @@ const REQUIRED = {
   PAYMENTS_MODE: 'decision',
   EVIDENCE_RETENTION_DAYS: 'decision',
   TOKEN_RETENTION_DAYS: 'decision',
+  MAIL_MAILER: 'decision',
+  MAIL_GRAPH_CLIENT_ID: 'technical',
   MAIL_HOST: 'decision',
   MAIL_USERNAME: 'decision',
   MAIL_PASSWORD: 'decision',
@@ -68,8 +70,12 @@ const REQUIRED = {
   MYSQL_BINLOG_RETENTION_DAYS: 'decision',
 };
 const REQUIRED_NAMES = Object.keys(REQUIRED).sort();
-/** Required to be present, but empty is allowed (`${NAME?}`): a mail relay without a login. */
-const MAY_BE_EMPTY = ['MAIL_PASSWORD', 'MAIL_USERNAME'];
+/**
+ * Required to be present, but empty is allowed (`${NAME?}`): a mail relay without a login, and the
+ * settings of the mail way that is not chosen (MAIL_HOST with graph, MAIL_GRAPH_CLIENT_ID with
+ * smtp; api/docker/entrypoint.sh and the preflight require the ones the chosen way needs).
+ */
+const MAY_BE_EMPTY = ['MAIL_PASSWORD', 'MAIL_USERNAME', 'MAIL_HOST', 'MAIL_GRAPH_CLIENT_ID'];
 
 const AUTH_LIMITS = [
   'REGISTER_IP', 'REGISTER_ACCOUNT', 'LOGIN_ACCOUNT_IP', 'LOGIN_IP', 'LOGIN_ACCOUNT', 'FORGOT_IP',
@@ -216,8 +222,13 @@ test('required settings: only allow-listed settings have defaults', () => {
     const expected = ALLOWED_DEFAULTS[name].value;
     if (expected !== undefined) assert.equal([...values][0], expected, `${name}'s default`);
   }
-  // The log mailer would write every code into the container log: SMTP in every service that mails.
-  for (const name of ['api', 'scheduler']) assert.equal(base().services[name].environment.MAIL_MAILER, 'smtp', name);
+  // How mail goes out is an operator decision without a default (graph or smtp; the entrypoint
+  // refuses everything else, the log mailer above all, which would write every code into the
+  // container log): required in every service that mails, the same in each.
+  for (const name of ['api', 'scheduler']) {
+    assert.match(serviceText(name), /^ {6}MAIL_MAILER: \$\{MAIL_MAILER:\?[^}\n]+\}$/m, `${name}: MAIL_MAILER is required, without a default`);
+    assert.equal(base().services[name].environment.MAIL_MAILER, ciValues().MAIL_MAILER, name);
+  }
 });
 
 test('required settings: PAYMENTS_MODE is required, the same in api and the scheduler, and its modes are the code\'s', () => {
@@ -232,6 +243,57 @@ test('required settings: PAYMENTS_MODE is required, the same in api and the sche
   assert.equal(config.services.seed.environment.PAYMENTS_MODE, undefined, 'the seed creates an account only');
   const preflight = readText(path.join(DEPLOY_DIR, 'scripts', 'preflight.sh'));
   assert.equal(/PAYMENTS_PATTERN='([^']+)'/.exec(preflight)?.[1], '^(off|test)$', 'the preflight accepts exactly off and test');
+});
+
+// The mailers Laravel ships besides smtp: each one stops the api image's start and fails the
+// preflight. log would write every code into the container log, array would drop the mail.
+const OTHER_MAILERS = ['log', 'array', 'failover', 'roundrobin', 'sendmail', 'ses', 'postmark', 'resend'];
+
+test("mail: the api image's entrypoint stops the start without graph or smtp, or without a setting the chosen way needs", () => {
+  // api/docker/entrypoint.sh (api and the scheduler) in the pinned busybox image, with a stand-in
+  // php: a start that passes the checks ends in `echo started`. Fake values only.
+  const client = '00000000-0000-4000-8000-00000000000b';
+  const common = 'APP_KEY=base64:ci-only-not-a-secret TRUSTED_PROXIES=172.30.99.10 MAIL_FROM_ADDRESS=ci-only@example.invalid';
+  const cases = {
+    graph: [`MAIL_MAILER=graph MAIL_GRAPH_CLIENT_ID=${client}`, null],
+    smtp: ['MAIL_MAILER=smtp MAIL_HOST=mailpit', null],
+    'graph-without-client': ['MAIL_MAILER=graph MAIL_HOST=mailpit', 'MAIL_GRAPH_CLIENT_ID'],
+    'smtp-without-host': [`MAIL_MAILER=smtp MAIL_GRAPH_CLIENT_ID=${client}`, 'MAIL_HOST'],
+    'no-mailer': ['MAIL_HOST=mailpit', 'MAIL_MAILER'],
+    ...Object.fromEntries(OTHER_MAILERS.map((mailer) => [mailer, [`MAIL_MAILER=${mailer} MAIL_HOST=mailpit`, 'MAIL_MAILER']])),
+    'no-sender': ['MAIL_MAILER=smtp MAIL_HOST=mailpit MAIL_FROM_ADDRESS=', 'MAIL_FROM_ADDRESS'],
+  };
+  const driver = [
+    'mkdir -p /var/www/api /usr/local/bin',
+    "printf '#!/bin/sh\\nexit 0\\n' > /usr/local/bin/php && chmod 755 /usr/local/bin/php",
+    ...Object.entries(cases).map(([name, [vars]]) => `out=$(env -i PATH=/usr/local/bin:/usr/bin:/bin ${common} ${vars} sh /opt/goenn-entrypoint.sh echo started 2>&1); printf '=== %s exit %s\\n%s\\n' '${name}' "$?" "$out"`),
+  ].join('\n');
+  const r = dockerRun(serviceImage('storage-init'), {
+    mounts: [{ src: path.join(REPO_ROOT, 'api', 'docker', 'entrypoint.sh'), dst: '/opt/goenn-entrypoint.sh' }],
+    entrypoint: 'sh',
+    args: ['-c', driver],
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const runs = Object.fromEntries(r.stdout.split(/^=== /m).slice(1).map((chunk) => {
+    const [head, ...rest] = chunk.split('\n');
+    const [, name, code] = /^(\S+) exit (\d+)$/.exec(head);
+    return [name, { code: Number(code), out: rest.join('\n') }];
+  }));
+  assert.deepEqual(Object.keys(runs).sort(), Object.keys(cases).sort(), r.stdout);
+  console.log(`mail entrypoint: ${Object.keys(cases).length} cases`);
+  for (const [name, [, missing]] of Object.entries(cases)) {
+    const { code, out } = runs[name];
+    if (missing === null) {
+      assert.equal(code, 0, `${name}:\n${out}`);
+      assert.match(out, /^started$/m, `${name} did not start`);
+    } else {
+      assert.equal(code, 1, `${name}: the start went on:\n${out}`);
+      assert.match(out, new RegExp(`ERROR: required settings missing or invalid:.*\\b${missing}\\(`), `${name}: ${missing} is not named:\n${out}`);
+      assert.doesNotMatch(out, /^started$/m, `${name} started anyway`);
+    }
+    // Names only, never values.
+    for (const value of [client, 'mailpit', 'ci-only@example.invalid']) assert.ok(!out.includes(value), `${name} printed a value`);
+  }
 });
 
 test('settings are documented in .env.example (blank, with who decides), deploy/ci.env and the runbook', () => {
@@ -275,7 +337,7 @@ test('ci-only env file is labelled and holds only fake values', () => {
     /^(10|172\.(1[6-9]|2\d|3[01])|192\.168)(\.\d{1,3}){1,2}$/,
   ];
   // A mode of the code rather than a value, one per setting: the one that moves no real money.
-  const ciModes = { PAYMENTS_MODE: 'test' };
+  const ciModes = { PAYMENTS_MODE: 'test', MAIL_MAILER: 'smtp' };
   const problems = [];
   for (const { name, value, line } of settings) {
     if (name.startsWith('ADMIN_')) problems.push(`${line}: ${name} (admin values never live in an env file)`);
@@ -820,6 +882,13 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     "envfile /work/backups; sed -i 's/^TOKEN_RETENTION_DAYS=.*/TOKEN_RETENTION_DAYS=7d/' /work/prod.env; run token-days",
     "envfile /work/backups; sed -i 's/^PAYMENTS_MODE=.*/PAYMENTS_MODE=on/' /work/prod.env; run payments-on",
     "envfile /work/backups; sed -i 's/^PAYMENTS_MODE=.*/PAYMENTS_MODE=off/' /work/prod.env; run payments-off",
+    "envfile /work/backups; sed -i 's/^MAIL_MAILER=.*/MAIL_MAILER=/' /work/prod.env; run mailer-empty",
+    ...OTHER_MAILERS.map((mailer) => `envfile /work/backups; sed -i 's/^MAIL_MAILER=.*/MAIL_MAILER=${mailer}/' /work/prod.env; run mailer-${mailer}`),
+    "envfile /work/backups; sed -i 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' /work/prod.env; run graph-no-client",
+    "envfile /work/backups; sed -i -e 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' -e 's/^MAIL_GRAPH_CLIENT_ID=.*/MAIL_GRAPH_CLIENT_ID=not-a-guid/' /work/prod.env; run graph-client-not-a-guid",
+    "envfile /work/backups; sed -i -e 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' -e 's/^MAIL_GRAPH_CLIENT_ID=.*/MAIL_GRAPH_CLIENT_ID=00000000-0000-4000-8000-00000000000b/' -e 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run graph-ok",
+    "envfile /work/backups; sed -i 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run smtp-no-host",
+    "envfile /work/backups; sed -i 's/^MAIL_FROM_ADDRESS=.*/MAIL_FROM_ADDRESS=not-an-address/' /work/prod.env; run sender-not-an-address",
     'envfile /work/backups; DB_PASSWORD=shell-value-not-a-secret run shell-export',
     'envfile /work/backups; FAKE_DOCKER_STATUS=1 run compose-fails',
     'ENV_FILE=/work/none.env run no-env-file',
@@ -854,6 +923,13 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     'token-days': [1, 'FAIL  TOKEN_RETENTION_DAYS has a valid form: whole days, at least 1'],
     'payments-on': [1, 'FAIL  PAYMENTS_MODE has a valid form: off or test'],
     'payments-off': [0, null],
+    'mailer-empty': [1, 'FAIL  MAIL_MAILER has a valid form: graph or smtp'],
+    ...Object.fromEntries(OTHER_MAILERS.map((mailer) => [`mailer-${mailer}`, [1, 'FAIL  MAIL_MAILER has a valid form: graph or smtp']])),
+    'graph-no-client': [1, "FAIL  MAIL_GRAPH_CLIENT_ID has a valid form: the managed identity's client ID, a GUID"],
+    'graph-client-not-a-guid': [1, "FAIL  MAIL_GRAPH_CLIENT_ID has a valid form: the managed identity's client ID, a GUID"],
+    'graph-ok': [0, null],
+    'smtp-no-host': [1, 'FAIL  MAIL_HOST is set (MAIL_MAILER=smtp)'],
+    'sender-not-an-address': [1, 'FAIL  MAIL_FROM_ADDRESS has a valid form: an e-mail address'],
     'shell-export': [1, "FAIL  set in this shell as well, docker compose would use the shell's value (unset them): DB_PASSWORD"],
     'compose-fails': [1, 'FAIL  docker compose renders the production compose'],
     'no-env-file': [1, 'FAIL  the env file exists'],
@@ -867,7 +943,7 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     assert.match(out, /preflight: \d+ checks, \d+ failed/, `${name}: no total`);
     for (const value of [...secrets, 'shell-value-not-a-secret']) assert.ok(!out.includes(value), `${name} printed a value`);
   }
-  assert.match(runs.ok.out, /preflight: 1[0-9] checks, 0 failed/);
+  assert.match(runs.ok.out, /preflight: 17 checks, 0 failed/);
   assert.match(r.stdout, /^docker: compose --project-directory \/clone\/deploy --env-file \/work\/prod\.env -f \/clone\/deploy\/docker-compose\.yml config --quiet $/m);
 });
 
@@ -1209,6 +1285,7 @@ test('the CI override closes every network, publishes no port and sends every ma
   for (const [name, n] of Object.entries(config.networks)) assert.equal(n.internal, true, `${name} is internal in CI`);
   assert.deepEqual(servicesOf(config).filter(([, s]) => (s.ports ?? []).length > 0).map(([n]) => n), []);
   for (const name of ['api', 'scheduler']) {
+    assert.equal(config.services[name].environment.MAIL_MAILER, 'smtp', name);
     assert.equal(config.services[name].environment.MAIL_HOST, 'mailpit', name);
     assert.equal(config.services[name].depends_on?.mailpit?.condition, 'service_healthy', name);
   }

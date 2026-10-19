@@ -18,6 +18,9 @@
 #   - EVIDENCE_RETENTION_DAYS and TOKEN_RETENTION_DAYS are whole days (the scheduler's prune
 #     refuses anything else), and PAYMENTS_MODE is `off` or `test` (Laravel would treat any other
 #     value as off, without a word);
+#   - MAIL_MAILER is `graph` or `smtp`, and the chosen way has what it needs: the managed
+#     identity's client ID (a GUID) for graph, MAIL_HOST for smtp; MAIL_FROM_ADDRESS is an
+#     address (the image's entrypoint refuses the same when api or the scheduler starts);
 #   - docker compose renders the production compose with this file, so every required setting
 #     is there.
 set -Euo pipefail
@@ -38,6 +41,11 @@ readonly LOG_SIZE_PATTERN='^[1-9][0-9]{0,5}[kmg]$'
 readonly LOG_FILES_PATTERN='^([2-9]|[1-9][0-9]{1,2})$'
 # The two modes of api/config/club.php (App\Support\Payments).
 readonly PAYMENTS_PATTERN='^(off|test)$'
+# The two ways mail goes out (api/config/mail.php; api/docker/entrypoint.sh refuses the rest), the
+# managed identity's client ID (a GUID) and a sender address.
+readonly MAILER_PATTERN='^(graph|smtp)$'
+readonly GUID_PATTERN='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
+readonly ADDRESS_PATTERN='^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
 
 checks=0
 failed=0
@@ -133,6 +141,20 @@ valid LOG_MAX_FILES "$LOG_FILES_PATTERN" 'a number of files, at least 2'
 valid EVIDENCE_RETENTION_DAYS "$RETENTION_PATTERN" 'whole days, at least 1'
 valid TOKEN_RETENTION_DAYS "$RETENTION_PATTERN" 'whole days, at least 1'
 valid PAYMENTS_MODE "$PAYMENTS_PATTERN" 'off or test'
+
+# Mail (deploy/README.md, Settings): one way, and what that way needs; nothing falls back.
+mailer=$(setting MAIL_MAILER)
+valid MAIL_MAILER "$MAILER_PATTERN" 'graph or smtp (never log: it would write every code into the container log)'
+if [[ "$mailer" == graph ]]; then
+  valid MAIL_GRAPH_CLIENT_ID "$GUID_PATTERN" "the managed identity's client ID, a GUID (MAIL_MAILER=graph)"
+elif [[ "$mailer" == smtp ]]; then
+  if [[ -n "$(setting MAIL_HOST)" ]]; then
+    pass 'MAIL_HOST is set (MAIL_MAILER=smtp)'
+  else
+    flunk 'MAIL_HOST is set (MAIL_MAILER=smtp)'
+  fi
+fi
+valid MAIL_FROM_ADDRESS "$ADDRESS_PATTERN" 'an e-mail address: the sender mailbox'
 
 if docker compose --project-directory "$deploy_dir" --env-file "$env_file" \
   -f "$deploy_dir/docker-compose.yml" config --quiet; then

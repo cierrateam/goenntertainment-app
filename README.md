@@ -52,7 +52,8 @@ The screens live in [`src/app`](src/app) and use [file-based routing](https://do
 ### Mail in development
 
 Laravel (`api/`) sends 2FA codes, password reset codes, the codes that confirm a new e-mail
-address or a first password, and other mail over SMTP. In
+address or a first password, and other mail. A server sends it through Microsoft Graph or over
+SMTP ([`deploy/README.md`](deploy/README.md#settings), `MAIL_MAILER`). In
 development a local mail catcher, [Mailpit](https://github.com/axllent/mailpit),
 receives every mail, so no code is ever written to a log:
 

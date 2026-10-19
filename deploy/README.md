@@ -33,7 +33,7 @@ Internet ─► caddy :80/:443   HTTPS, security headers, the upload allow-list
 |---|---|---|---|---|---|
 | `caddy` | `caddy:2-alpine` (pinned) | the only service with host ports; gets and renews the certificate for `<DOMAIN>`; sends the security headers; passes the allowed upload paths to `media` and everything else to `api` | edge, media | `caddy-data`, `caddy-config`, `deploy/Caddyfile` | long-running; starts only after `admin-gate` succeeded and `api` is healthy |
 | `media` | `caddy:2-alpine` (pinned) | serves the public uploads as plain files, for caddy only (`deploy/Caddyfile.media`); runs as `nobody`, read-only, without settings or keys | media | `uploads` (read-only), `deploy/Caddyfile.media` | long-running |
-| `api` | built from `api/Dockerfile` | Laravel on port 8080 as the user `www-data` (uid 33); runs the migrations before Apache starts; answers every route; stores the uploads, checked and re-encoded, in two volumes outside its docroot; sends mail over SMTP | edge, app | `uploads`, `private-media` | long-running |
+| `api` | built from `api/Dockerfile` | Laravel on port 8080 as the user `www-data` (uid 33); runs the migrations before Apache starts; answers every route; stores the uploads, checked and re-encoded, in two volumes outside its docroot; sends mail through Microsoft Graph or over SMTP (`MAIL_MAILER`) | edge, app | `uploads`, `private-media` | long-running |
 | `scheduler` | built from `api/Dockerfile` | `php artisan schedule:work` (`api/routes/console.php`): club renewals every hour, credit expiry every five minutes, the credit reminder mails every day, the retention prune every hour; no Apache | app, outbound | `private-media` | long-running; starts once `api` is healthy |
 | `db` | `mysql:8.4` (pinned) | the database `goenntertainment`; on the very first start (empty volume) it creates the daily rotation of its binary log (`deploy/mysql/02-binlog-rotate.sql`); the tables come from api's migrations | app, data | `db-data` | long-running |
 | `backup` | `mysql:8.4` (pinned) | a database dump and an uploads archive every night at 02:30 UTC and once at start, then pruning (`deploy/scripts/backup.sh`) | data | `uploads` and `private-media` (read-only; the evidence images, mode 640, through the `www-data` group), `<BACKUP_DIR>` (host folder) | long-running |
@@ -48,11 +48,11 @@ Networks (the compose file's footer has the details):
 
 | Network | Who is on it | Way out |
 |---|---|---|
-| edge | caddy (fixed address `<APP_NET_PREFIX>.10`), api | yes: certificates for caddy, SMTP for api |
+| edge | caddy (fixed address `<APP_NET_PREFIX>.10`), api | yes: certificates for caddy, mail for api (Microsoft Graph or SMTP) |
 | media | caddy, media | none (internal) |
 | app | api, scheduler, db | none (internal) |
 | data | db, backup, admin-gate, seed | none (internal) |
-| outbound | scheduler | yes: SMTP for the credit reminders |
+| outbound | scheduler | yes: mail for the credit reminders (Microsoft Graph or SMTP) |
 
 caddy reaches neither the scheduler nor db, and db has no way out. Laravel trusts the client
 address only from caddy's fixed address (F-31).
@@ -121,8 +121,10 @@ The mobile app is not a container: it is built with EAS and carries the server a
 - **DNS**: an A record for `<DOMAIN>` pointing to the server's IPv4 address, in place before caddy
   starts for the first time (the certificate authority checks the name). No AAAA record.
 - **Firewall**: inbound 22 (SSH), 80 and 443, nothing else. Outbound: caddy to the certificate
-  authority, api and the scheduler to the SMTP provider, and the image builds to the container
-  registries and package mirrors.
+  authority, api and the scheduler to the mail service (with `graph`: `graph.microsoft.com` and
+  the server's metadata endpoint, [Mail through Microsoft Graph](#mail-through-microsoft-graph);
+  with `smtp`: the provider), and the image builds to the container registries and package
+  mirrors.
 - A **password manager** for the generated secrets and `APP_KEY` (below).
 
 ## Settings
@@ -150,10 +152,12 @@ missing one. `deploy/.env.example` carries the same list with longer comments.
 | `PAYMENTS_MODE` | whether buying credits, club plans and paid bookings works: `off` refuses them, `test` books them without real money (no payment provider is connected yet); on a public server `test` gives everyone credits and club plans for nothing | `______` (the operator, with whoever answers for the business) | `off` or `test` |
 | `EVIDENCE_RETENTION_DAYS` | days to keep evidence images of bans and timeouts (the image goes, the record stays) | `______` (the operator, with whoever answers for data protection) | whole days, at least 1 |
 | `TOKEN_RETENTION_DAYS` | days to keep sign-in tokens and two-factor, reset and e-mail codes after they stopped being valid | `______` (the operator, with whoever answers for data protection) | whole days, at least 1 |
-| `MAIL_HOST` | the SMTP host of the mail provider; two-factor, password-reset and e-mail-change codes and the credit reminders go out by mail | `______` (the operator: the mail provider) | a host name; port 587 unless `MAIL_PORT` says otherwise, `MAIL_SCHEME=smtps` for TLS from the start |
-| `MAIL_USERNAME` | the SMTP login | `______` (the operator) | must be in the file; empty only for a relay without login |
-| `MAIL_PASSWORD` | the SMTP password | `______` (the operator) | must be in the file; empty only for a relay without login |
-| `MAIL_FROM_ADDRESS` | the sender address of every mail | `______` (the operator: the sender mailbox) | an e-mail address |
+| `MAIL_MAILER` | how mail goes out (two-factor, password-reset and e-mail-change codes, the credit reminders): `graph` is Microsoft Graph as the server's managed identity ([Mail through Microsoft Graph](#mail-through-microsoft-graph)), `smtp` an SMTP provider; never `log`, with which api and the scheduler do not start | `______` (the operator) | `graph` or `smtp` |
+| `MAIL_GRAPH_CLIENT_ID` | with `graph`: the client ID of the server's user-assigned managed identity; not a secret | technical: an output of the hosting platform's stack | a GUID; empty with `smtp` |
+| `MAIL_HOST` | with `smtp`: the SMTP host of the mail provider | `______` (the operator: the mail provider) | a host name, port 587 unless `MAIL_PORT` says otherwise, `MAIL_SCHEME=smtps` for TLS from the start; empty with `graph` |
+| `MAIL_USERNAME` | with `smtp`: the SMTP login | `______` (the operator) | must be in the file; empty with `graph`, or for a relay without login |
+| `MAIL_PASSWORD` | with `smtp`: the SMTP password | `______` (the operator) | must be in the file; empty with `graph`, or for a relay without login |
+| `MAIL_FROM_ADDRESS` | the sender address of every mail; with `graph`, the mailbox the identity may send as | `______` (the operator: the sender mailbox) | an e-mail address |
 | `BACKUP_DIR` | the host folder the backup service writes to | `______` (the operator: where, who looks after it) | an absolute path outside the clone, owned by root, mode 700 |
 | `BACKUP_RETENTION_DAYS` | days a backup set is kept | `______` (the operator, with whoever answers for data protection) | whole days, at least 1 |
 | `LOG_MAX_SIZE` | the size of one container log file | `______` (the operator, with whoever answers for data protection) | a whole number with the unit `k`, `m` or `g` |
@@ -184,8 +188,58 @@ total, never a value, and exits 1 when a check fails. It checks that `deploy/.en
 600 or 400; that none of its settings is also set in the shell (docker compose would take the
 shell's value); that `<BACKUP_DIR>` is an existing absolute path outside the clone, owned by root
 with mode 700; the form of `BACKUP_RETENTION_DAYS`, `MYSQL_BINLOG_RETENTION_DAYS`, `LOG_MAX_SIZE`,
-`LOG_MAX_FILES`, `EVIDENCE_RETENTION_DAYS`, `TOKEN_RETENTION_DAYS` and `PAYMENTS_MODE`; and that
-docker compose renders the production compose with the file.
+`LOG_MAX_FILES`, `EVIDENCE_RETENTION_DAYS`, `TOKEN_RETENTION_DAYS` and `PAYMENTS_MODE`; that
+`MAIL_MAILER` is `graph` or `smtp` and the chosen way has what it needs (a GUID in
+`MAIL_GRAPH_CLIENT_ID`, or `MAIL_HOST`), with an address in `MAIL_FROM_ADDRESS`; and that docker
+compose renders the production compose with the file. api and the scheduler check the mail
+settings again when they start: a setting the chosen way needs that is empty stops them with
+`ERROR: required settings missing or invalid` (`api/docker/entrypoint.sh`).
+
+### Mail through Microsoft Graph
+
+With `MAIL_MAILER=graph` the app sends through Microsoft Graph as the server's user-assigned
+managed identity (`api/app/Mail/GraphTransport.php`). There is no app registration and no
+secret: the token comes from the server's metadata endpoint (`169.254.169.254`, plain HTTP,
+reachable from the server only), is kept encrypted in the database's cache table until five
+minutes before it expires, and nothing needs rotating. Every mail goes out as the one mailbox in
+`MAIL_FROM_ADDRESS`, as JSON with `saveToSentItems: false`, so the mailbox keeps no copy of a
+code.
+
+What the hosting platform provides:
+
+- the user-assigned managed identity, attached to the server: its client ID goes into
+  `MAIL_GRAPH_CLIENT_ID`, its principal ID is needed once, below;
+- outbound HTTPS to `graph.microsoft.com` for api and the scheduler, and their way to the
+  metadata endpoint.
+
+What Microsoft 365 must provide (an Exchange administrator does it; no tenant values belong in
+this repository):
+
+- a mailbox for `MAIL_FROM_ADDRESS`; a shared mailbox needs no licence up to 50 GB;
+- the domain of that address as an accepted domain, with its verification, SPF, DKIM and DMARC
+  records (in Cloudflare as DNS only);
+- **no** Microsoft Graph permission consented to the identity in Microsoft Entra ID: a consented
+  `Mail.Send` would let it send as every mailbox of the tenant, and Exchange's scope cannot
+  narrow a grant made there;
+- in Exchange Online PowerShell, the role "Application Mail.Send" for the identity, scoped to the
+  one mailbox, and a check of the scope:
+
+```powershell
+New-ServicePrincipal -AppId <client ID> -ObjectId <principal ID> -DisplayName <a name>
+New-ManagementScope -Name <scope name> -RecipientRestrictionFilter "PrimarySmtpAddress -eq '<MAIL_FROM_ADDRESS>'"
+New-ManagementRoleAssignment -Role "Application Mail.Send" -App <client ID> -CustomResourceScope <scope name>
+Test-ServicePrincipalAuthorization -Identity <client ID> -Resource <MAIL_FROM_ADDRESS>
+Test-ServicePrincipalAuthorization -Identity <client ID> -Resource <another mailbox>
+```
+
+  The first check must show the role with `InScope` `True`, the second with `False`. A change of
+  the assignment takes 30 minutes to 2 hours to apply;
+- an outbound spam policy for the mailbox that caps its external recipients per hour: the app's
+  mail counts against the tenant-wide limit.
+
+That Exchange accepts a managed identity this way follows from its documentation for service
+principals but has not been tried yet. If it refuses, the way out is an app registration with a
+certificate credential (never a client secret), as a later change to the app.
 
 ## First start
 
@@ -517,7 +571,9 @@ string, every request header with the values of `Authorization` and `Cookie` rep
 `REDACTED` (the app sends its token in `Authorization`), the TLS version, cipher and server name,
 the status, the response size and duration, and the response headers. Laravel logs from
 `LOG_LEVEL` up (default `warning`), in api and in the scheduler; the project's rule is that no
-password, token or code is ever logged (`AGENTS.md`).
+password, token or code is ever logged (`AGENTS.md`). With Microsoft Graph, a mail that is not
+sent logs `[mail-graph] mail not sent` at error level, with the request (`token` or `send`), the
+HTTP status, the error code and a hint: never the token, a recipient or the mail itself.
 
 MySQL's binary log is not a container log: it lives in the `db-data` volume. MySQL deletes a
 binary-log file only when the log rotates, once the file's last write is more than
@@ -554,6 +610,8 @@ operator, with whoever answers for data protection).
 | `failed to create network ...: Pool overlaps with other one on this address space` | `APP_NET_PREFIX` is used by another network on the host: pick a free /24 |
 | api stays `unhealthy` | `docker compose logs api`: `ERROR: required settings missing or invalid` names them; a failed migration shows its error before Apache starts; otherwise usually a wrong `DB_PASSWORD` |
 | club renewals, credit expiry or the reminder mails do not happen | `docker compose logs scheduler`; `Retention settings missing or invalid` names a setting of the prune |
+| a code mail is not sent; `docker compose logs api` shows `[mail-graph] mail not sent` | the line names the request, the status, the error code and a hint. `token` 400: the identity is not attached to the server, or `MAIL_GRAPH_CLIENT_ID` is not its client ID. `token` 404 or 410: the metadata endpoint is updating, just after a boot; it passes within a minute or two. No answer: api or the scheduler does not reach the metadata endpoint or Graph. `send` 403 `ErrorAccessDenied`: the role assignment is missing, does not cover `MAIL_FROM_ADDRESS`, or is not applied yet (up to 2 hours). `send` 404: `MAIL_FROM_ADDRESS` is not a mailbox of the tenant ([Mail through Microsoft Graph](#mail-through-microsoft-graph)) |
+| `[mail-graph] mail settings missing or invalid` | `MAIL_GRAPH_CLIENT_ID` is not a GUID or `MAIL_FROM_ADDRESS` is not an address: [Settings](#settings) |
 | db exits right away | `docker compose logs db`: `MYSQL_BINLOG_RETENTION_DAYS must be ...` means the value is not 1 to 9999 or `off` |
 | no container starts: `failed to initialize logging driver: compression cannot be enabled when max file count is 1` | `LOG_MAX_FILES=1`: set it to 2 or more (`scripts/preflight.sh` refuses 1), then `docker compose up -d` |
 | backup `unhealthy` | `docker compose logs backup`: `BACKUP_DIR` missing or not writable, an invalid `BACKUP_RETENTION_DAYS`, the database did not answer within about 5 minutes (`did not answer`; each run waits for it, also after a reboot), or a failed run (`nothing was deleted`) |
@@ -600,7 +658,7 @@ row are required: the stack does not start without them.
 |---|---|---|
 | the backend domain (`DOMAIN`), and HSTS `includeSubDomains`/`preload` for the whole business domain | the operator, with the domain owner | `______` |
 | the hosting provider and the server size | the operator | `______` |
-| the mail provider and the sender mailbox (`MAIL_HOST`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_FROM_ADDRESS`) | the operator | `______` |
+| how mail goes out (`MAIL_MAILER`: Microsoft Graph or SMTP), the sender mailbox (`MAIL_FROM_ADDRESS`), and with SMTP the provider (`MAIL_HOST`, `MAIL_USERNAME`, `MAIL_PASSWORD`) | the operator | `______` |
 | whether the server takes payments in test mode, without real money (`PAYMENTS_MODE`) | the operator, with whoever answers for the business | `______` |
 | retention of evidence images and expired sign-in data (`EVIDENCE_RETENTION_DAYS`, `TOKEN_RETENTION_DAYS`) | the operator, with whoever answers for data protection | `______` |
 | where the backups live, who looks after them, the offsite copy, encryption at rest, and how long sets are kept (`BACKUP_DIR`, `BACKUP_RETENTION_DAYS`) | the operator, with whoever answers for data protection | `______` |

@@ -180,18 +180,24 @@ services:
       # echtes Geld. Echte Zahlungen kommen erst mit einem Zahlungsanbieter. Which one a server
       # runs is an operator decision without a default; the scheduler reads the same setting.
       PAYMENTS_MODE: ${PAYMENTS_MODE:?PAYMENTS_MODE is missing in deploy/.env (off or test, an operator decision; see deploy/.env.example)}
-      # Mail-Versand für 2FA-Codes und „Passwort vergessen". Always SMTP: the log mailer would
-      # write every code into the container log. Which provider and which sender address are
-      # operator decisions, so both are required.
-      MAIL_MAILER: smtp
-      MAIL_HOST: ${MAIL_HOST:?MAIL_HOST is missing in deploy/.env (the mail provider, an operator decision; see deploy/.env.example)}
+      # Mail: two-factor, password-reset and e-mail-change codes, and the credit reminders. How it
+      # goes out is an operator decision without a default: `graph` (Microsoft Graph as the
+      # server's managed identity, api/app/Mail/GraphTransport.php) or `smtp`. Never the log
+      # mailer: it would write every code into the container log. Every line below must be in
+      # deploy/.env, empty where the chosen way does not use it; the image's entrypoint stops the
+      # start when one the chosen way needs is empty (api/docker/entrypoint.sh).
+      MAIL_MAILER: ${MAIL_MAILER:?MAIL_MAILER is missing in deploy/.env (graph or smtp, an operator decision; see deploy/.env.example)}
+      # Microsoft Graph: the client ID of the server's user-assigned managed identity (no secret).
+      MAIL_GRAPH_CLIENT_ID: ${MAIL_GRAPH_CLIENT_ID?MAIL_GRAPH_CLIENT_ID is missing in deploy/.env (empty with MAIL_MAILER=smtp; see deploy/.env.example)}
+      # SMTP: the provider. MAIL_USERNAME and MAIL_PASSWORD may be empty for a relay without login.
+      MAIL_HOST: ${MAIL_HOST?MAIL_HOST is missing in deploy/.env (empty with MAIL_MAILER=graph; see deploy/.env.example)}
       MAIL_PORT: ${MAIL_PORT:-587}
-      # Must be in deploy/.env; may be empty for a relay that takes mail without a login.
       MAIL_USERNAME: ${MAIL_USERNAME?MAIL_USERNAME is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
       MAIL_PASSWORD: ${MAIL_PASSWORD?MAIL_PASSWORD is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
       MAIL_SCHEME: ${MAIL_SCHEME:-}
       # Never in clear text: STARTTLS (or smtps) or no mail at all (api/config/mail.php).
       MAIL_REQUIRE_TLS: 'true'
+      # The sender of every mail; with graph, the mailbox the identity may send as.
       MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:?MAIL_FROM_ADDRESS is missing in deploy/.env (the sender mailbox, an operator decision; see deploy/.env.example)}
       MAIL_FROM_NAME: GÖ4Fun
       # Nur dieser Container spielt Schema-Änderungen ein, nicht auch noch der scheduler – zwei
@@ -263,8 +269,10 @@ services:
       QUEUE_CONNECTION: sync
       # The same as api's: club renewals charge through it.
       PAYMENTS_MODE: ${PAYMENTS_MODE:?PAYMENTS_MODE is missing in deploy/.env (off or test, an operator decision; see deploy/.env.example)}
-      MAIL_MAILER: smtp
-      MAIL_HOST: ${MAIL_HOST:?MAIL_HOST is missing in deploy/.env (the mail provider, an operator decision; see deploy/.env.example)}
+      # The same mail settings as api's (the credit reminders).
+      MAIL_MAILER: ${MAIL_MAILER:?MAIL_MAILER is missing in deploy/.env (graph or smtp, an operator decision; see deploy/.env.example)}
+      MAIL_GRAPH_CLIENT_ID: ${MAIL_GRAPH_CLIENT_ID?MAIL_GRAPH_CLIENT_ID is missing in deploy/.env (empty with MAIL_MAILER=smtp; see deploy/.env.example)}
+      MAIL_HOST: ${MAIL_HOST?MAIL_HOST is missing in deploy/.env (empty with MAIL_MAILER=graph; see deploy/.env.example)}
       MAIL_PORT: ${MAIL_PORT:-587}
       MAIL_USERNAME: ${MAIL_USERNAME?MAIL_USERNAME is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
       MAIL_PASSWORD: ${MAIL_PASSWORD?MAIL_PASSWORD is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
