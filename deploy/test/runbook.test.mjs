@@ -1,8 +1,10 @@
 // Checks of the deploy runbook (deploy/README.md) against the files it describes: its sections,
 // the first-start order that keeps the public edge down until an admin account exists, commands
 // that never put a secret on a command line, the restore steps, the update steps, and the values it
-// shares with the code. Most checks read files only; the service check renders the compose and the
-// entrypoint check runs a script in the pinned busybox image (Docker, no network).
+// shares with the code. Most checks read files only; the service check renders the compose, the
+// entrypoint check runs a script in the pinned busybox image, and the metadata check runs the
+// runbook's own helper with the pinned caddy image's wget and in the db image's bash (Docker, no
+// network).
 //
 //   node --test deploy/test/runbook.test.mjs        (npm run test:deploy runs every deploy test)
 //
@@ -282,6 +284,76 @@ test('F-05: the first start keeps the public edge down until the admin account e
   assert.deepEqual(sorted, Object.keys(order), 'the first-start steps are out of order');
   // Before the seed, nothing may start caddy: every earlier up names its services, without caddy.
   for (const u of ups.filter((x) => x.i < seed)) assert.ok(u.call.services.length > 0 && !u.call.services.includes('caddy'), `starts caddy before the admin exists: ${cmds[u.i]}`);
+});
+
+/** A word for a POSIX shell: single-quoted, with any single quote in it closed and reopened. */
+const shellWord = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+test("First start: the metadata endpoint's negative checks send the Metadata header and take only wget's failure to connect as no answer", () => {
+  const cmds = commands(section('First start'));
+  const helpers = cmds.filter((c) => /^noanswer\(\) \{/.test(c));
+  assert.equal(helpers.length, 1, '"First start" does not define noanswer() exactly once');
+  // Every wget to the endpoint is a negative check through noanswer: caddy itself, and a
+  // throwaway container of the caddy image on each network with a way out.
+  const checks = cmds.filter((c) => /\bwget\b/.test(c) && c.includes('169.254.169.254'));
+  console.log(`metadata endpoint: ${checks.length} negative checks in "First start"`);
+  assert.deepEqual(checks.map((c) => /^noanswer (\S+) /.exec(c)?.[1] ?? c), ['caddy', 'edge', 'outbound'], 'the negative checks');
+  assert.match(checks[0], /^noanswer caddy docker compose exec -T caddy wget /);
+  for (const [i, net] of [[1, 'edge'], [2, 'outbound']]) {
+    assert.ok(checks[i].startsWith(`noanswer ${net} docker run --rm --network deploy_${net} --entrypoint wget "$(docker compose images -q caddy)" `), `the ${net} check does not run the caddy image's wget on deploy_${net}`);
+  }
+  // One request for all three, with the header: without it the endpoint answers 400 even where it
+  // is reachable, and wget fails on that as it fails on no answer.
+  const REQUEST = /\s(-q -T \d+ -O \/dev\/null --header 'Metadata: true' 'http:\/\/169\.254\.169\.254\/[^'\s]+')$/;
+  const requests = checks.map((c) => REQUEST.exec(c)?.[1]);
+  assert.ok(requests[0] && requests.every((r) => r === requests[0]), `the checks do not all send the same request with --header 'Metadata: true':\n${checks.join('\n')}`);
+  const at = (target) => requests[0].replace('http://169.254.169.254', `http://${target}`);
+
+  // The helper as the runbook defines it, with the wget of the pinned caddy image, the one the
+  // checks run: a server that answers 400 and one that answers 200 (answers: STOP); a closed port,
+  // an address without a route, and a server that takes the connection and never answers (no
+  // answer; busybox says `download timed out` for that as for the platform's drop); and two
+  // commands that fail before any wget runs (STOP). Each case runs twice, bare (`raw`, for its
+  // message) and through noanswer; a listener that never answers takes one connection, so each
+  // run of that case gets its own.
+  const cases = [
+    ['answers-400', () => `wget ${at('127.0.0.1:8400')}`, 'STOP', /^wget: server returned error: HTTP\/1\.1 400 Bad Request$/],
+    ['answers-200', () => `wget ${at('127.0.0.1:8200')}`, 'STOP', /^$/],
+    ['refused', () => `wget ${at('127.0.0.1:8399')}`, 'no answer', /^wget: can't connect to remote host \(127\.0\.0\.1\): Connection refused$/],
+    ['no-route', () => `wget ${at('192.0.2.1')}`, 'no answer', /^wget: can't connect to remote host \(192\.0\.2\.1\): Network unreachable$/],
+    ['times-out', (run) => `wget ${at(run === 'raw' ? '127.0.0.1:8300' : '127.0.0.1:8301')}`, 'no answer', /^wget: download timed out$/],
+    ['not-a-command', () => 'no-such-command-goenn', 'STOP', /not found/],
+    ['docker-fails', () => `sh -c ${shellWord('echo "docker: Error response from daemon: network deploy_edgee not found." >&2; exit 125')}`, 'STOP', /network deploy_edgee not found/],
+  ];
+  const decide = (stdout) => Object.fromEntries(String(stdout).split('\n').map((l) => /^(\S+): (no answer|STOP.*)$/.exec(l)).filter(Boolean).map((m) => [m[1], m[2]]));
+  const busybox = dockerRun(serviceImage('caddy'), {
+    entrypoint: 'sh',
+    args: ['-c', [
+      helpers[0],
+      // What each command prints, and its exit code, for the replay in bash below.
+      'raw() { label=$1; shift; out=$("$@" 2>&1); printf "raw %s %s %s\\n" "$label" "$?" "$out"; }',
+      'caddy respond --status 400 --listen 127.0.0.1:8400 >/dev/null 2>&1 &',
+      'caddy respond --status 200 --listen 127.0.0.1:8200 >/dev/null 2>&1 &',
+      'for port in 8300 8301; do (sleep 120 | nc -l -p "$port") >/dev/null 2>&1 & done',
+      'i=0; until wget -q -T 1 -O /dev/null http://127.0.0.1:8200/ 2>/dev/null || [ "$i" -ge 30 ]; do i=$((i + 1)); sleep 1; done',
+      'i=0; until wget -q -T 1 -O /dev/null http://127.0.0.1:8400/ 2>&1 | grep -q "server returned error" || [ "$i" -ge 30 ]; do i=$((i + 1)); sleep 1; done',
+      ...cases.flatMap(([label, command]) => [`raw ${label} ${command('raw')}`, `noanswer ${label} ${command('noanswer')}`]),
+    ].join('\n')],
+  });
+  assert.equal(busybox.status, 0, busybox.stderr);
+  const raw = Object.fromEntries(busybox.stdout.split('\n').map((l) => /^raw (\S+) (\d+) ?(.*)$/.exec(l)).filter(Boolean).map((m) => [m[1], { code: Number(m[2]), out: m[3] }]));
+  const inBusybox = decide(busybox.stdout);
+  console.log(`noanswer with busybox's wget: ${cases.map(([label]) => `${label}: ${raw[label]?.out || `exit ${raw[label]?.code}, no message`} -> ${inBusybox[label]?.split(',')[0]}`).join('; ')}`);
+  for (const [label, , decision, message] of cases) {
+    assert.match(raw[label]?.out ?? '(no run)', message, `${label}: wget's message`);
+    assert.ok(inBusybox[label]?.startsWith(decision), `${label}: expected "${decision}", got "${inBusybox[label]}"`);
+  }
+  // The operator runs it in bash: the same helper decides the same on the same messages there.
+  const inBash = decide(dockerRun(serviceImage('db'), {
+    entrypoint: 'bash',
+    args: ['-c', [helpers[0], ...cases.map(([label]) => `noanswer ${label} sh -c 'printf "%s\\n" "$1" >&2; exit "$2"' _ ${shellWord(raw[label].out)} ${raw[label].code}`)].join('\n')],
+  }).stdout);
+  assert.deepEqual(cases.map(([label]) => inBash[label]?.startsWith('no answer') ? 'no answer' : inBash[label]?.slice(0, 4)), cases.map(([, , decision]) => decision), 'bash decides otherwise');
 });
 
 test('F-18: no runbook command puts a password on a command line or prints a secret', () => {

@@ -443,20 +443,30 @@ shows up at once as Cloudflare's error 525, not as a lock that silently stays op
 
 10. With `MAIL_MAILER=graph`: check the metadata endpoint, now and again after the server's first
     reboot. api and the scheduler get a token (only the status line is printed, never the
-    token); caddy and any other container on the edge network get no answer:
+    token); caddy, and a throwaway container on each of the two networks with a way out, get no
+    answer. The endpoint answers a request without `Metadata: true` with 400, so the checks send
+    the header; and wget fails on every status but 200 as it fails on no answer, so `noanswer`
+    goes by wget's own message: only `download timed out` (what the platform's drop gives) and
+    `can't connect to remote host` count as no answer:
 
     ```bash
     docker compose exec -T api php -r '$c = stream_context_create(["http" => ["header" => "Metadata: true", "timeout" => 5, "ignore_errors" => true]]); @file_get_contents("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com&client_id=" . getenv("MAIL_GRAPH_CLIENT_ID"), false, $c); echo ($http_response_header[0] ?? "no answer"), PHP_EOL;'
     docker compose exec -T scheduler php -r '$c = stream_context_create(["http" => ["header" => "Metadata: true", "timeout" => 5, "ignore_errors" => true]]); @file_get_contents("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com&client_id=" . getenv("MAIL_GRAPH_CLIENT_ID"), false, $c); echo ($http_response_header[0] ?? "no answer"), PHP_EOL;'
-    docker compose exec -T caddy wget -q -T 5 -O /dev/null 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' && echo 'caddy: answered' || echo 'caddy: no answer'
-    docker run --rm --network deploy_edge --entrypoint wget "$(docker compose images -q caddy)" -q -T 5 -O /dev/null 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' && echo 'another container: answered' || echo 'another container: no answer'
+    noanswer() { label=$1; shift; out=$("$@" 2>&1); code=$?; case "$out" in *'wget: download timed out'*|*'connect to remote host ('*) echo "$label: no answer" ;; *) echo "$label: STOP, the endpoint answered or the check did not run (exit $code): ${out:-no message}" ;; esac; }
+    noanswer caddy docker compose exec -T caddy wget -q -T 5 -O /dev/null --header 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
+    noanswer edge docker run --rm --network deploy_edge --entrypoint wget "$(docker compose images -q caddy)" -q -T 5 -O /dev/null --header 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
+    noanswer outbound docker run --rm --network deploy_outbound --entrypoint wget "$(docker compose images -q caddy)" -q -T 5 -O /dev/null --header 'Metadata: true' 'http://169.254.169.254/metadata/instance?api-version=2021-02-01'
     iptables -S DOCKER-USER
     ```
 
-    Expected: `HTTP/1.1 200 OK` from api and from the scheduler, `caddy: no answer`, `another
-    container: no answer`, and the two rules of step 3 above the platform's drop. After the
-    reboot, the same; a missing rule means the unit did not run: `systemctl status
-    goenn-metadata-access.service`. Then send a test mail: a password reset for a test account.
+    Expected: `HTTP/1.1 200 OK` from api and from the scheduler; `caddy: no answer`, `edge: no
+    answer` and `outbound: no answer`; and the two rules of step 3 above the platform's drop. A
+    line with `STOP` means that the endpoint answered there, or that the check did not run, and it
+    ends with wget's or Docker's own message: `exit 0` without a message is a 200, `server returned
+    error` any other status, anything else a command that failed (a wrong network name, say). Do
+    not go on until all three say `no answer`. After the reboot, the same; a missing rule means
+    the unit did not run: `systemctl status goenn-metadata-access.service`. Then send a test
+    mail: a password reset for a test account.
 
 11. Confirm the first backup: `docker compose logs backup` shows `run ... written`, and
     `ls -l <BACKUP_DIR>` lists one `db-`, `uploads-` and `SHA256SUMS-` file.
