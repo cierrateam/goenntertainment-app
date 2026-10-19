@@ -68,6 +68,8 @@ function step(name, fn) {
 }
 
 const tail = (text, n = 1500) => String(text ?? '').slice(-n);
+/** The directives of a Cache-Control value, lower case and sorted: 'no-store, private' -> ['no-store', 'private']. */
+const directives = (value) => String(value ?? '').toLowerCase().split(',').map((d) => d.trim()).filter(Boolean).sort();
 /** How many answers had which status: { 404: 30 }. */
 const tally = (results) => results.reduce((acc, r) => ({ ...acc, [r.status ?? r.error]: (acc[r.status ?? r.error] ?? 0) + 1 }), {});
 
@@ -459,7 +461,9 @@ check("F-11: an evidence image leaves the server only through Laravel's admin ro
   assert.match(header(withToken, 'content-type') ?? '', /^image\//);
   assert.equal(header(withToken, 'x-content-type-options'), 'nosniff');
   assert.match(header(withToken, 'content-security-policy') ?? '', /sandbox/);
-  assert.match(header(withToken, 'cache-control') ?? '', /no-store/);
+  // Exactly these two directives, through the edge as well: Cloudflare caches .jpg, .png and
+  // .webp by extension, and only this header keeps ban evidence out of its cache.
+  assert.deepEqual(directives(header(withToken, 'cache-control')), ['no-store', 'private'], `the evidence answer's Cache-Control: ${header(withToken, 'cache-control')}`);
   assert.equal(without.status, 401);
   assert.equal(asViewer.status, 403);
   assert.ok(asFile.status >= 400 && asFile.status < 500, `/storage/evidence/ answered ${asFile.status ?? asFile.error}`);

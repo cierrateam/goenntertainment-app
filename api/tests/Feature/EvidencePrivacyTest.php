@@ -95,6 +95,27 @@ class EvidencePrivacyTest extends AppFeatureTestCase
         $this->getJson($url)->assertUnauthorized();
     }
 
+    /**
+     * Behind Cloudflare, which caches .jpg, .png and .webp by their extension, this one header is
+     * what keeps ban evidence out of its cache (and out of every other one): Cloudflare does not
+     * cache an answer marked private or no-store (deploy/README.md, Cloudflare and the load
+     * balancer). Exactly these two directives, no max-age, no public. Symfony writes them sorted.
+     */
+    public function test_the_evidence_answer_may_be_kept_by_no_cache(): void
+    {
+        $target = $this->makeUser();
+        [$token, $path] = $this->banWithEvidence($target);
+
+        $response = $this->withBearer($token)->get('/api/admin/evidence-files/'.basename($path))->assertOk();
+
+        $value = (string) $response->headers->get('Cache-Control');
+        $this->assertSame('no-store, private', $value);
+        $directives = array_map(trim(...), explode(',', strtolower($value)));
+        sort($directives);
+        $this->assertSame(['no-store', 'private'], $directives);
+        $this->assertFalse($response->headers->has('Expires'), 'an Expires header would let a cache keep the image');
+    }
+
     public function test_names_outside_the_stored_pattern_are_not_found(): void
     {
         $admin = $this->makeUser(['is_admin' => true]);
