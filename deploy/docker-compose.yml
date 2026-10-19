@@ -18,7 +18,9 @@
 #   data      db <-> backup, admin-gate, seed. Internal.
 #   outbound  the scheduler alone: its way out to the mail provider (credit reminders).
 # caddy reaches neither the scheduler nor db, db has no way out, and caddy and api share exactly
-# one network, so api sees caddy at one fixed address (F-31).
+# one network, so api sees caddy at one fixed address (F-31). api and the scheduler have fixed
+# addresses as well: the host lets these two, and no other container, reach the metadata endpoint
+# for the graph mailer's token (scripts/metadata-access.sh).
 #
 # Every setting without a default is required: docker compose refuses to start until deploy/.env
 # sets it (deploy/.env.example lists them, with who decides each). Before the first start and
@@ -224,7 +226,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
-    networks: [edge, app]
+    networks:
+      edge:
+        # Fixed: the host lets this address and the scheduler's, and no other container, reach the
+        # metadata endpoint for the graph mailer's token (scripts/metadata-access.sh).
+        ipv4_address: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.20
+      app: {}
     security_opt: ['no-new-privileges:true']
     cap_drop: [ALL]
     logging: *logging
@@ -294,7 +301,11 @@ services:
     # The image checks Apache, which does not run in this container.
     healthcheck:
       disable: true
-    networks: [app, outbound]
+    networks:
+      app: {}
+      outbound:
+        # Fixed, like api's: the host lets it reach the metadata endpoint (scripts/metadata-access.sh).
+        ipv4_address: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.140
     security_opt: ['no-new-privileges:true']
     cap_drop: [ALL]
     logging: *logging
@@ -480,11 +491,13 @@ volumes:
   private-media:
 
 # APP_NET_PREFIX (the first three parts of a free private /24 on this host, see
-# deploy/.env.example) holds the edge network, with a fixed proxy address (F-31):
-#   edge  <prefix>.0/25    caddy at .10; Laravel trusts forwarding headers from it only
-#                          (TRUSTED_PROXIES). Other containers get .64-.127.
-# So no other container can take the fixed address. The other networks get their addresses from
-# Docker. No network has IPv6 (see caddy's ports).
+# deploy/.env.example) holds the two networks with a way out, with fixed addresses:
+#   edge      <prefix>.0/25    caddy at .10: Laravel trusts forwarding headers from it only
+#                              (TRUSTED_PROXIES, F-31); api at .20. Other containers get .64-.127.
+#   outbound  <prefix>.128/25  the scheduler at .140. Other containers get .192-.255.
+# So no other container can take a fixed address. The host lets api's and the scheduler's
+# addresses, and no other, reach the metadata endpoint (scripts/metadata-access.sh). The internal
+# networks get their addresses from Docker. No network has IPv6 (see caddy's ports).
 networks:
   edge:
     enable_ipv6: false
@@ -503,3 +516,7 @@ networks:
     enable_ipv6: false
   outbound:
     enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.128/25
+          ip_range: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.192/26

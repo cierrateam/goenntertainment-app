@@ -50,17 +50,20 @@ Networks (the compose file's footer has the details):
 
 | Network | Who is on it | Way out |
 |---|---|---|
-| edge | caddy (fixed address `<APP_NET_PREFIX>.10`), api | yes: caddy's published port, mail for api (Microsoft Graph or SMTP); caddy itself calls out to nothing |
+| edge | caddy (fixed address `<APP_NET_PREFIX>.10`), api (fixed address `<APP_NET_PREFIX>.20`) | yes: caddy's published port, mail for api (Microsoft Graph or SMTP); caddy itself calls out to nothing |
 | media | caddy, media | none (internal) |
 | app | api, scheduler, db | none (internal) |
 | data | db, backup, admin-gate, seed | none (internal) |
-| outbound | scheduler | yes: mail for the credit reminders (Microsoft Graph or SMTP) |
+| outbound | scheduler (fixed address `<APP_NET_PREFIX>.140`, in `<APP_NET_PREFIX>.128/25`) | yes: mail for the credit reminders (Microsoft Graph or SMTP) |
 
 caddy reaches neither the scheduler nor db, and db has no way out. Laravel trusts the client
 address only from caddy's fixed address (F-31). caddy takes the visitor's address from
 Cloudflare's `CF-Connecting-IP` header and passes it on as `X-Forwarded-For`; it may take that
 header from any source only because nobody but Cloudflare completes a TLS handshake with it
-([Cloudflare and the load balancer](#cloudflare-and-the-load-balancer)).
+([Cloudflare and the load balancer](#cloudflare-and-the-load-balancer)). Only api's and the
+scheduler's fixed addresses reach the server's metadata endpoint (`169.254.169.254`), where the
+graph mailer gets its token: the platform drops every other container's traffic to it, and
+`deploy/scripts/metadata-access.sh` lets these two through (step 3 of [First start](#first-start)).
 
 Why the uploads have a file server of their own: Caddy follows symbolic links, and it has no
 setting to refuse them. A link planted in the `uploads` volume under an allowed name would make
@@ -102,6 +105,7 @@ The mobile app is not a container: it is built with EAS and carries the server a
 | `deploy/Caddyfile.media` | the media service: the same upload rule, plain files from the `uploads` volume |
 | `deploy/.env.example` | the template for `deploy/.env`, with who decides each setting |
 | `deploy/scripts/preflight.sh` | checks `deploy/.env`, `<BACKUP_DIR>` and `<ORIGIN_TLS_DIR>` before a start |
+| `deploy/scripts/metadata-access.sh`, `deploy/systemd/goenn-metadata-access.service` | the two host rules that let api and the scheduler reach the metadata endpoint, and the systemd unit that adds them at every boot and every Docker restart |
 | `deploy/scripts/backup.sh`, `deploy/scripts/admin-gate.sh`, `deploy/scripts/db-entrypoint.sh` | the scripts of the backup, admin-gate and db services |
 | `deploy/mysql/02-binlog-rotate.sql` | the event that rotates MySQL's binary log every day, created on the db service's first start |
 | `api/Dockerfile` | the image built on the server (api, scheduler and seed) |
@@ -130,6 +134,11 @@ The mobile app is not a container: it is built with EAS and carries the server a
   `graph.microsoft.com` and the server's metadata endpoint,
   [Mail through Microsoft Graph](#mail-through-microsoft-graph); with `smtp`: the provider), and
   the image builds to the container registries and package mirrors. caddy calls out to nothing.
+- **The metadata endpoint**: the platform drops all container traffic to `169.254.169.254` (a
+  rule at the end of Docker's `DOCKER-USER` chain, applied again after every reboot and every
+  Docker restart), and the server has the user-assigned managed identity attached
+  ([Mail through Microsoft Graph](#mail-through-microsoft-graph)). The app lets api and the
+  scheduler through, and no other container (step 3 of [First start](#first-start)).
 - **The origin certificate files** in `<ORIGIN_TLS_DIR>`
   ([Origin certificate and Authenticated Origin Pulls](#origin-certificate-and-authenticated-origin-pulls)).
 - A **password manager** for the generated secrets and `APP_KEY` (below).
@@ -180,7 +189,7 @@ missing one. `deploy/.env.example` carries the same list with longer comments.
 | `DB_PASSWORD` | password of the database user `goenn` (api, scheduler, backup, admin-gate, seed) | technical: generated | `openssl rand -base64 24` |
 | `DB_ROOT_PASSWORD` | MySQL's root password (used for a restore) | technical: generated | `openssl rand -base64 24` |
 | `APP_KEY` | Laravel's encryption key; it encrypts the two-factor secrets | technical: generated once, never changed | `echo "base64:$(openssl rand -base64 32)"` |
-| `APP_NET_PREFIX` | the first three parts of a private /24 that nothing else on the host uses; the compose puts the edge network, with caddy's fixed address, into it | technical: the operator | three numbers, e.g. `172.30.42`; check with `ip -4 addr` and `docker network inspect` |
+| `APP_NET_PREFIX` | the first three parts of a private /24 that nothing else on the host uses; the compose puts the edge and outbound networks, with the fixed addresses of caddy, api and the scheduler, into it | technical: the operator | three numbers from 0 to 255, e.g. `172.30.42`; check with `ip -4 addr` and `docker network inspect` |
 | `ORIGIN_TLS_DIR` | the host folder with the origin certificate, its key and the origin-pull CA ([Origin certificate and Authenticated Origin Pulls](#origin-certificate-and-authenticated-origin-pulls)) | technical: the operator | an absolute path outside the clone, owned by root and writable by root only |
 | `PAYMENTS_MODE` | whether buying credits, club plans and paid bookings works: `off` refuses them, `test` books them without real money (no payment provider is connected yet); on a public server `test` gives everyone credits and club plans for nothing | `______` (the operator, with whoever answers for the business) | `off` or `test` |
 | `EVIDENCE_RETENTION_DAYS` | days to keep evidence images of bans and timeouts (the image goes, the record stays) | `______` (the operator, with whoever answers for data protection) | whole days, at least 1 |
@@ -279,8 +288,10 @@ What the hosting platform provides:
 
 - the user-assigned managed identity, attached to the server: its client ID goes into
   `MAIL_GRAPH_CLIENT_ID`, its principal ID is needed once, below;
-- outbound HTTPS to `graph.microsoft.com` for api and the scheduler, and their way to the
-  metadata endpoint.
+- outbound HTTPS to `graph.microsoft.com` for api and the scheduler;
+- the rule that drops all container traffic to the metadata endpoint
+  ([Prerequisites](#prerequisites)); the app lets api and the scheduler, and no other container,
+  past it (step 3 of [First start](#first-start)).
 
 What Microsoft 365 must provide (an Exchange administrator does it; no tenant values belong in
 this repository):
@@ -342,14 +353,32 @@ shows up at once as Cloudflare's error 525, not as a lock that silently stays op
    scripts/preflight.sh
    ```
 
-3. Build the images, with fresh copies of the pinned base images (`--profile tools` builds the
+3. Let api and the scheduler, and no other container, reach the metadata endpoint for the graph
+   mailer's token: install the unit that adds their two rules to Docker's `DOCKER-USER` chain at
+   every boot and every Docker restart (`deploy/systemd/goenn-metadata-access.service`, which runs
+   `scripts/metadata-access.sh`), then look at the chain:
+
+   ```bash
+   sed "s|@DEPLOY_DIR@|$(pwd -P)|" systemd/goenn-metadata-access.service > /etc/systemd/system/goenn-metadata-access.service
+   systemctl daemon-reload
+   systemctl enable --now goenn-metadata-access.service
+   journalctl -u goenn-metadata-access.service --no-pager -n 5
+   iptables -S DOCKER-USER
+   ```
+
+   Expected: `added:` (on a later run `found:`) for `<APP_NET_PREFIX>.20` and
+   `<APP_NET_PREFIX>.140`, and two rules `-j ACCEPT` to `169.254.169.254/32`, each from one
+   address, at the top of `DOCKER-USER`, above the platform's drop. With `MAIL_MAILER=smtp` they
+   are not needed and do no harm.
+
+4. Build the images, with fresh copies of the pinned base images (`--profile tools` builds the
    seed image too):
 
    ```bash
    docker compose --profile tools build --pull
    ```
 
-4. Start everything except caddy, and wait until db and api report `healthy` (api runs the
+5. Start everything except caddy, and wait until db and api report `healthy` (api runs the
    migrations first; the first start takes a few minutes):
 
    ```bash
@@ -362,7 +391,7 @@ shows up at once as Cloudflare's error 525, not as a lock that silently stays op
    on every start (`php artisan migrate --force`, `api/docker/entrypoint.sh`); they also create the
    category list the app shows. Never load a schema file by hand.
 
-5. Create the admin account. Who the admin is (the address), how many admin accounts there are
+6. Create the admin account. Who the admin is (the address), how many admin accounts there are
    and who approves an admin grant: `______` (whoever is accountable for the app, to be named
    before go-live). The address and the password are typed in, exist only in the shell variables
    and the one `--rm` container, and are removed right after. The command applies the app's
@@ -382,7 +411,7 @@ shows up at once as Cloudflare's error 525, not as a lock that silently stays op
    account or resets a password. A further admin is an account that exists in the app, promoted
    with `docker compose exec api php artisan admin:grant <address>` (`--revoke` takes it back).
 
-6. Check that an admin exists, without printing anything secret:
+7. Check that an admin exists, without printing anything secret:
 
    ```bash
    docker compose run --rm admin-gate
@@ -390,14 +419,14 @@ shows up at once as Cloudflare's error 525, not as a lock that silently stays op
 
    Expected: `admin-gate: 1 admin account(s); caddy may start.`
 
-7. Start the rest. The gate passes, and caddy starts with the origin certificate:
+8. Start the rest. The gate passes, and caddy starts with the origin certificate:
 
    ```bash
    docker compose up -d
    docker compose ps
    ```
 
-8. Check from outside:
+9. Check from outside:
 
    ```bash
    curl -sSI https://<DOMAIN>/api/health
@@ -412,16 +441,33 @@ shows up at once as Cloudflare's error 525, not as a lock that silently stays op
    balancer's NAT rule, the firewall, or caddy is down: `docker compose logs caddy --tail 50`).
    Then run the checks of [What runs](#what-runs).
 
-9. Confirm the first backup: `docker compose logs backup` shows `run ... written`, and
-   `ls -l <BACKUP_DIR>` lists one `db-`, `uploads-` and `SHA256SUMS-` file.
+10. With `MAIL_MAILER=graph`: check the metadata endpoint, now and again after the server's first
+    reboot. api and the scheduler get a token (only the status line is printed, never the
+    token); caddy and any other container on the edge network get no answer:
+
+    ```bash
+    docker compose exec -T api php -r '$c = stream_context_create(["http" => ["header" => "Metadata: true", "timeout" => 5, "ignore_errors" => true]]); @file_get_contents("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com&client_id=" . getenv("MAIL_GRAPH_CLIENT_ID"), false, $c); echo ($http_response_header[0] ?? "no answer"), PHP_EOL;'
+    docker compose exec -T scheduler php -r '$c = stream_context_create(["http" => ["header" => "Metadata: true", "timeout" => 5, "ignore_errors" => true]]); @file_get_contents("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://graph.microsoft.com&client_id=" . getenv("MAIL_GRAPH_CLIENT_ID"), false, $c); echo ($http_response_header[0] ?? "no answer"), PHP_EOL;'
+    docker compose exec -T caddy wget -q -T 5 -O /dev/null 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' && echo 'caddy: answered' || echo 'caddy: no answer'
+    docker run --rm --network deploy_edge --entrypoint wget "$(docker compose images -q caddy)" -q -T 5 -O /dev/null 'http://169.254.169.254/metadata/instance?api-version=2021-02-01' && echo 'another container: answered' || echo 'another container: no answer'
+    iptables -S DOCKER-USER
+    ```
+
+    Expected: `HTTP/1.1 200 OK` from api and from the scheduler, `caddy: no answer`, `another
+    container: no answer`, and the two rules of step 3 above the platform's drop. After the
+    reboot, the same; a missing rule means the unit did not run: `systemctl status
+    goenn-metadata-access.service`. Then send a test mail: a password reset for a test account.
+
+11. Confirm the first backup: `docker compose logs backup` shows `run ... written`, and
+    `ls -l <BACKUP_DIR>` lists one `db-`, `uploads-` and `SHA256SUMS-` file.
 
 Partners, offers and voucher batches are created by an admin in the app's admin area. There is no
 demo data for a server: `php artisan db:seed --class=DemoMarketplaceSeeder` refuses to run in
 production.
 
-Restoring onto a fresh server instead: steps 1 to 4 with the old `APP_KEY` (the other secrets may
+Restoring onto a fresh server instead: steps 1 to 5 with the old `APP_KEY` (the other secrets may
 be new: the dump holds the app's data, not MySQL's accounts), then [Restore](#restore), without
-steps 5 and 6.
+steps 6 and 7.
 
 ## The app build
 
@@ -593,7 +639,7 @@ of its own, not into the new `<BACKUP_DIR>`: the backup service deletes sets the
    (cd <SET_DIR> && sha256sum -c "SHA256SUMS-$stamp")
    ```
 
-2. Stop the services that write (on a new server: after step 4 of [First start](#first-start)):
+2. Stop the services that write (on a new server: after step 5 of [First start](#first-start)):
 
    ```bash
    docker compose stop caddy api scheduler backup
@@ -700,11 +746,11 @@ operator, with whoever answers for data protection).
 |---|---|
 | `required variable <NAME> is missing a value: <NAME> is missing in deploy/.env ...` | a required setting is empty or missing: [Settings](#settings) |
 | `scripts/preflight.sh` prints `FAIL` | the line says what to fix; the env file needs mode 600, `<BACKUP_DIR>` root and mode 700 outside the clone |
-| `service "admin-gate" didn't complete successfully: exit 1` on `docker compose up -d`, caddy stays `Created` | no admin account yet: steps 5 and 6 of [First start](#first-start); `docker compose run --rm admin-gate` says why |
+| `service "admin-gate" didn't complete successfully: exit 1` on `docker compose up -d`, caddy stays `Created` | no admin account yet: steps 6 and 7 of [First start](#first-start); `docker compose run --rm admin-gate` says why |
 | `failed to create network ...: Pool overlaps with other one on this address space` | `APP_NET_PREFIX` is used by another network on the host: pick a free /24 |
 | api stays `unhealthy` | `docker compose logs api`: `ERROR: required settings missing or invalid` names them; a failed migration shows its error before Apache starts; otherwise usually a wrong `DB_PASSWORD` |
 | club renewals, credit expiry or the reminder mails do not happen | `docker compose logs scheduler`; `Retention settings missing or invalid` names a setting of the prune |
-| a code mail is not sent; `docker compose logs api` shows `[mail-graph] mail not sent` | the line names the request, the status, the error code and a hint. `token` 400: the identity is not attached to the server, or `MAIL_GRAPH_CLIENT_ID` is not its client ID. `token` 404 or 410: the metadata endpoint is updating, just after a boot; it passes within a minute or two. No answer: api or the scheduler does not reach the metadata endpoint or Graph. `send` 403 `ErrorAccessDenied`: the role assignment is missing, does not cover `MAIL_FROM_ADDRESS`, or is not applied yet (up to 2 hours). `send` 404: `MAIL_FROM_ADDRESS` is not a mailbox of the tenant ([Mail through Microsoft Graph](#mail-through-microsoft-graph)) |
+| a code mail is not sent; `docker compose logs api` shows `[mail-graph] mail not sent` | the line names the request, the status, the error code and a hint. `token` 400: the identity is not attached to the server, or `MAIL_GRAPH_CLIENT_ID` is not its client ID. `token` 404 or 410: the metadata endpoint is updating, just after a boot; it passes within a minute or two. No answer: api or the scheduler does not reach the metadata endpoint (is `goenn-metadata-access.service` active, and does `iptables -S DOCKER-USER` show its two rules? Step 3 of [First start](#first-start)) or Graph. `send` 403 `ErrorAccessDenied`: the role assignment is missing, does not cover `MAIL_FROM_ADDRESS`, or is not applied yet (up to 2 hours). `send` 404: `MAIL_FROM_ADDRESS` is not a mailbox of the tenant ([Mail through Microsoft Graph](#mail-through-microsoft-graph)) |
 | `[mail-graph] mail settings missing or invalid` | `MAIL_GRAPH_CLIENT_ID` is not a GUID or `MAIL_FROM_ADDRESS` is not an address: [Settings](#settings) |
 | db exits right away | `docker compose logs db`: `MYSQL_BINLOG_RETENTION_DAYS must be ...` means the value is not 1 to 9999 or `off` |
 | no container starts: `failed to initialize logging driver: compression cannot be enabled when max file count is 1` | `LOG_MAX_FILES=1`: set it to 2 or more (`scripts/preflight.sh` refuses 1), then `docker compose up -d` |
@@ -741,13 +787,18 @@ On every pull request:
   Cloudflare's part is played with a throw-away CA and client certificate made for each run: no
   handshake without the client certificate, under any server name; the address in
   `CF-Connecting-IP` is the one Laravel's rate limits count; nothing answers on port 80; uploads
-  carry their `Cache-Control` and the ban evidence `private, no-store`.
+  carry their `Cache-Control` and the ban evidence `private, no-store`. The script that lets api
+  and the scheduler reach the metadata endpoint runs against a stand-in `iptables`: it adds
+  exactly their two addresses, as the compose gives them, each as a single address, adds nothing
+  on a second run and refuses a malformed `APP_NET_PREFIX`.
   Locally: `npm run test:deploy` (Docker needed) and the root README's
   [Tests and checks](../README.md#tests-and-checks).
 
 Not checked by CI: the real host, Cloudflare with its real certificates and settings, DNS, the
-load balancer and the firewall, the published port and the IPv6 path, a host reboot, and
-Dependabot's handling of the compose files.
+load balancer and the firewall, the published port and the IPv6 path, a host reboot, the real
+`DOCKER-USER` chain with the platform's drop and the unit that adds the two rules (step 10 of
+[First start](#first-start) checks them on the server), and Dependabot's handling of the compose
+files.
 The first start, the backup and the restore of this runbook were walked through on a local test
 stack of the earlier, Node-based setup (`deploy/ci.env` and the CI override, internal networks, no
 published ports); the stack test runs the same steps on this one; the host parts were not.

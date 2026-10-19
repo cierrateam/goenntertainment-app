@@ -19,6 +19,8 @@
 #     expired one fails every handshake with Cloudflare: 526 for the origin certificate, 525 for
 #     the CA), and origin-cert.pem names DOMAIN and belongs to the key. Run it as root: only root
 #     can read the key;
+#   - APP_NET_PREFIX is three numbers from 0 to 255 (scripts/metadata-access.sh, which lets api
+#     and the scheduler reach the metadata endpoint, refuses anything else);
 #   - BACKUP_RETENTION_DAYS, MYSQL_BINLOG_RETENTION_DAYS, LOG_MAX_SIZE and LOG_MAX_FILES have a
 #     valid form (the backup and db services check the first two again when they start);
 #     LOG_MAX_FILES is at least 2: Docker's `local` log driver compresses the rotated files and
@@ -43,6 +45,9 @@ env_file=${1:-$deploy_dir/.env}
 # deploy/test/static.test.mjs compares the patterns.
 readonly RETENTION_PATTERN='^[1-9][0-9]{0,4}$'
 readonly BINLOG_RETENTION_PATTERN='^([1-9][0-9]{0,3}|off)$'
+# Named mirror: deploy/scripts/metadata-access.sh (NET_PREFIX_PATTERN), which builds the host rules
+# from it. Three numbers from 0 to 255, without leading zeros.
+readonly NET_PREFIX_PATTERN='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){2}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
 # Docker's `local` log driver: a size with the unit k, m or g, and a number of files from 2 (the
 # driver compresses rotated files and refuses compression with one file).
 readonly LOG_SIZE_PATTERN='^[1-9][0-9]{0,5}[kmg]$'
@@ -249,6 +254,7 @@ valid() {
     flunk "$name has a valid form: $rule"
   fi
 }
+valid APP_NET_PREFIX "$NET_PREFIX_PATTERN" 'three numbers from 0 to 255, e.g. 172.30.42'
 valid BACKUP_RETENTION_DAYS "$RETENTION_PATTERN" 'whole days, at least 1'
 valid MYSQL_BINLOG_RETENTION_DAYS "$BINLOG_RETENTION_PATTERN" 'whole days from 1 to 9999, or off'
 valid LOG_MAX_SIZE "$LOG_SIZE_PATTERN" 'a size such as 10m (unit k, m or g)'

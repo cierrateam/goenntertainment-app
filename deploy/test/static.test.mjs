@@ -1000,6 +1000,8 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone, checks the edge
     "envfile /work/backups; sed -i -e 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' -e 's/^MAIL_GRAPH_CLIENT_ID=.*/MAIL_GRAPH_CLIENT_ID=00000000-0000-4000-8000-00000000000b/' -e 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run graph-ok",
     "envfile /work/backups; sed -i 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run smtp-no-host",
     "envfile /work/backups; sed -i 's/^MAIL_FROM_ADDRESS=.*/MAIL_FROM_ADDRESS=not-an-address/' /work/prod.env; run sender-not-an-address",
+    "envfile /work/backups; sed -i 's/^APP_NET_PREFIX=.*/APP_NET_PREFIX=172.30/' /work/prod.env; run prefix-two-parts",
+    "envfile /work/backups; sed -i 's/^APP_NET_PREFIX=.*/APP_NET_PREFIX=172.30.099/' /work/prod.env; run prefix-leading-zero",
     // The TLS folder and its three files.
     'envfile /work/backups relative/tls; run tls-relative',
     'envfile /work/backups /work/no-such-folder; run tls-missing',
@@ -1062,6 +1064,9 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone, checks the edge
     'graph-ok': [0, null],
     'smtp-no-host': [1, 'FAIL  MAIL_HOST is set (MAIL_MAILER=smtp)'],
     'sender-not-an-address': [1, 'FAIL  MAIL_FROM_ADDRESS has a valid form: an e-mail address'],
+    // scripts/metadata-access.sh builds the host rules from it and refuses the same.
+    'prefix-two-parts': [1, 'FAIL  APP_NET_PREFIX has a valid form: three numbers from 0 to 255'],
+    'prefix-leading-zero': [1, 'FAIL  APP_NET_PREFIX has a valid form: three numbers from 0 to 255'],
     'tls-relative': [1, 'FAIL  ORIGIN_TLS_DIR is an absolute path'],
     'tls-missing': [1, 'FAIL  ORIGIN_TLS_DIR is an existing directory'],
     'tls-inside-clone': [1, 'FAIL  ORIGIN_TLS_DIR lies outside this clone'],
@@ -1102,7 +1107,7 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone, checks the edge
   }
   // Every check passed with the good files: the key at mode 600, and at 400 (key-400); the
   // certificate and the CA at mode 644, readable by everyone.
-  assert.match(runs.ok.out, /preflight: 33 checks, 0 failed/);
+  assert.match(runs.ok.out, /preflight: 34 checks, 0 failed/);
   assert.match(r.stdout, /^docker: compose --project-directory \/clone\/deploy --env-file \/work\/prod\.env -f \/clone\/deploy\/docker-compose\.yml config --quiet $/m);
 });
 
@@ -1260,6 +1265,7 @@ test('settings checked in two places use the same patterns (preflight and the se
   const pairs = [
     ['RETENTION_PATTERN', 'backup.sh', 'RETENTION_PATTERN', 'preflight.sh'],
     ['BINLOG_RETENTION_PATTERN', 'db-entrypoint.sh', 'BINLOG_RETENTION_PATTERN', 'preflight.sh'],
+    ['NET_PREFIX_PATTERN', 'metadata-access.sh', 'NET_PREFIX_PATTERN', 'preflight.sh'],
   ];
   for (const [a, fileA, b, fileB] of pairs) {
     const left = read(fileA, a);
@@ -1276,6 +1282,8 @@ test('scripts the containers read from the working tree keep LF line ends', () =
   const files = [
     ...folder('scripts'),
     ...folder('mysql'),
+    // systemd reads the unit on the host; a carriage return would end up in ExecStart.
+    ...folder('systemd'),
     ...fs.readdirSync(DEPLOY_DIR).filter((f) => /^Caddyfile/.test(f)).map((f) => path.join(DEPLOY_DIR, f)),
   ];
   assert.ok(files.length > 1);
@@ -1424,20 +1432,151 @@ function hop(config, front, back) {
   return { network, ip, subnet: ipam.subnet, range: ipam.ip_range };
 }
 
-test("F-31: the trusted proxy address is caddy's fixed address (mirror)", () => {
+test("F-31: the trusted proxy address is caddy's fixed address (mirror); api's and the scheduler's are the only other fixed addresses", () => {
+  const prefix = ciValues().APP_NET_PREFIX;
   for (const [label, config] of [['production', base()], ['CI', ci()]]) {
     const edge = hop(config, 'caddy', 'api');
     assert.equal(config.services.api.environment.TRUSTED_PROXIES, edge.ip, `${label}: Laravel trusts caddy's address`);
-    assert.ok(edge.subnet && inCidr(edge.ip, edge.subnet), `${label}: ${edge.ip} lies in ${edge.network}'s fixed subnet`);
-    assert.ok(edge.range && !inCidr(edge.ip, edge.range), `${label}: ${edge.ip} lies outside ${edge.network}'s dynamic range: no other container can take it`);
-    assert.notEqual(ipToInt(edge.ip) % 2 ** (32 - Number(edge.subnet.split('/')[1])), 1, `${label}: ${edge.ip} is not the gateway`);
     // The scheduler serves nothing; the image's entrypoint requires the setting, and it is the same.
     assert.equal(config.services.scheduler.environment.TRUSTED_PROXIES, edge.ip, `${label}: the scheduler's TRUSTED_PROXIES`);
-    // Nobody else holds a fixed address: the one that is trusted belongs to caddy alone.
-    const fixed = servicesOf(config).flatMap(([name, s]) => Object.entries(s.networks ?? {}).filter(([, n]) => n?.ipv4_address).map(([net]) => `${name}@${net}`));
-    assert.deepEqual(fixed, [`caddy@${edge.network}`], `${label}: fixed addresses`);
-    console.log(`${label}: caddy ${edge.ip} on ${edge.network} (TRUSTED_PROXIES)`);
+    // The fixed addresses: caddy's, the one Laravel trusts, and the two the host lets reach the
+    // metadata endpoint (scripts/metadata-access.sh). Each comes from APP_NET_PREFIX, lies in its
+    // network's fixed subnet and outside its dynamic range (no other container can take it), and
+    // is not the gateway.
+    const fixed = servicesOf(config).flatMap(([name, s]) => Object.entries(s.networks ?? {})
+      .filter(([, n]) => n?.ipv4_address).map(([net, n]) => ({ at: `${name}@${net}`, net, ip: n.ipv4_address })));
+    assert.deepEqual(fixed.map((f) => `${f.at} ${f.ip}`).sort(), [`api@edge ${prefix}.20`, `caddy@edge ${prefix}.10`, `scheduler@outbound ${prefix}.140`], `${label}: fixed addresses`);
+    assert.equal(edge.ip, `${prefix}.10`, `${label}: the trusted address is caddy's`);
+    for (const f of fixed) {
+      const ipam = config.networks[f.net]?.ipam?.config?.[0] ?? {};
+      assert.ok(ipam.subnet && inCidr(f.ip, ipam.subnet), `${label}: ${f.at} lies in ${f.net}'s fixed subnet`);
+      assert.ok(ipam.ip_range && !inCidr(f.ip, ipam.ip_range), `${label}: ${f.at} lies outside ${f.net}'s dynamic range`);
+      assert.notEqual(ipToInt(f.ip) % 2 ** (32 - Number(ipam.subnet.split('/')[1])), 1, `${label}: ${f.at} is the gateway`);
+    }
+    // The two networks with a way out share the /24 of APP_NET_PREFIX, half each.
+    const ipamOf = (net) => { const c = config.networks[net]?.ipam?.config?.[0] ?? {}; return [c.subnet, c.ip_range]; };
+    assert.deepEqual(ipamOf('edge'), [`${prefix}.0/25`, `${prefix}.64/26`], `${label}: edge`);
+    assert.deepEqual(ipamOf('outbound'), [`${prefix}.128/25`, `${prefix}.192/26`], `${label}: outbound`);
+    console.log(`${label}: caddy ${edge.ip} on ${edge.network} (TRUSTED_PROXIES); ${fixed.filter((f) => !f.at.startsWith('caddy@')).map((f) => `${f.at} ${f.ip}`).join(', ')}`);
   }
+});
+
+// ------------------------------------------------------------------------------ metadata endpoint
+
+/**
+ * A stand-in for iptables (bash): Docker's DOCKER-USER chain as the lines of a file (no file: no
+ * chain), and every call recorded. It knows the three calls deploy/scripts/metadata-access.sh
+ * makes: list the chain (-n -L), check a rule (-C) and insert one (-I <chain> <position>).
+ */
+const IPTABLES_STAND_IN = String.raw`#!/bin/bash
+state=/work/DOCKER-USER
+printf '%s\n' "$*" >> /work/calls
+if [[ "$1" == -n && "$2" == -L ]]; then [[ "$3" == DOCKER-USER && -f "$state" ]]; exit; fi
+case "$1" in
+  -C) [[ "$2" == DOCKER-USER && -f "$state" ]] || exit 2; shift 2; grep -qxF -- "$*" "$state" ;;
+  -I) [[ "$2" == DOCKER-USER && -f "$state" ]] || exit 2; pos=$3; shift 3
+      { head -n $((pos - 1)) "$state"; printf '%s\n' "$*"; tail -n +"$pos" "$state"; } > "$state.new" && mv "$state.new" "$state" ;;
+  *) echo "stand-in iptables: unexpected call: $*" >&2; exit 2 ;;
+esac
+`;
+
+test("metadata endpoint: the host script lets exactly api's and the scheduler's fixed addresses through, one address each, once, and refuses a malformed APP_NET_PREFIX", () => {
+  // The addresses the compose gives api and the scheduler (the only fixed ones besides caddy's).
+  const config = base();
+  const fixedOf = (service) => Object.values(config.services[service].networks ?? {}).map((n) => n?.ipv4_address).filter(Boolean);
+  const expected = [...fixedOf('api'), ...fixedOf('scheduler')].sort();
+  assert.equal(expected.length, 2, `api and the scheduler have one fixed address each: ${expected.join(', ')}`);
+  const prefix = ciValues().APP_NET_PREFIX;
+  // Missing, empty and malformed values of APP_NET_PREFIX: two parts, four parts, a part over
+  // 255, a leading zero, a leading space.
+  const bad = { missing: null, empty: '', 'two-parts': '172.30', 'four-parts': '172.30.99.0', 'over-255': '256.1.1', 'leading-zero': '172.30.099', 'leading-space': ' 172.30.99' };
+  const driver = [
+    'set -u',
+    'mkdir -p /work',
+    "cat > /usr/local/sbin/iptables <<'EOF'",
+    IPTABLES_STAND_IN.trimEnd(),
+    'EOF',
+    'chmod 755 /usr/local/sbin/iptables',
+    // The platform's rules: the drop of all container traffic to the endpoint, then the return.
+    "printf '%s\\n' '-d 169.254.169.254/32 -j DROP' '-j RETURN' > /work/DOCKER-USER",
+    'setenv() { if [ "$1" = __missing__ ]; then echo "DOMAIN=localhost" > /work/env; else printf "APP_NET_PREFIX=%s\\n" "$1" > /work/env; fi; }',
+    "run() { : > /work/calls; out=$(bash /clone/deploy/scripts/metadata-access.sh /work/env 2>&1); code=$?; printf '=== %s exit %s\\n%s\\n--- calls\\n%s\\n--- chain\\n%s\\n' \"$1\" \"$code\" \"$out\" \"$(cat /work/calls)\" \"$(cat /work/DOCKER-USER 2>/dev/null)\"; }",
+    `setenv '${prefix}'; run first`,
+    'run second',
+    ...Object.entries(bad).map(([name, value]) => `setenv '${value ?? '__missing__'}'; run bad-${name}`),
+    `rm /work/DOCKER-USER; setenv '${prefix}'; run no-chain`,
+  ].join('\n');
+  const r = dockerRun(serviceImage('db'), { mounts: [{ src: DEPLOY_DIR, dst: '/clone/deploy' }], entrypoint: 'bash', args: ['-c', driver] });
+  assert.equal(r.status, 0, r.stderr);
+  const runs = Object.fromEntries(r.stdout.split(/^=== /m).slice(1).map((chunk) => {
+    const [head, ...rest] = chunk.split('\n');
+    const [, name, code] = /^(\S+) exit (\d+)$/.exec(head);
+    const [out, calls, chain] = rest.join('\n').split(/^--- (?:calls|chain)$/m).map((s) => s.trim());
+    return [name, { code: Number(code), out, calls: calls ? calls.split('\n') : [], chain: chain ? chain.split('\n') : [] }];
+  }));
+  assert.deepEqual(Object.keys(runs).sort(), ['first', 'second', ...Object.keys(bad).map((n) => `bad-${n}`), 'no-chain'].sort(), r.stdout);
+  const platform = ['-d 169.254.169.254/32 -j DROP', '-j RETURN'];
+  const ruleOf = (ip) => `-s ${ip}/32 -d 169.254.169.254/32 -p tcp --dport 80 -m comment --comment goenn-metadata -j ACCEPT`;
+
+  // The first run adds one rule per address at the top, above the platform's drop.
+  const { first, second } = runs;
+  console.log(`metadata-access: first run ${first.out.replace(/\n/g, '; ')}; second run ${second.out.replace(/\n/g, '; ')}`);
+  assert.equal(first.code, 0, first.out);
+  assert.deepEqual(first.out.split('\n').sort(), expected.map((ip) => `added: ${ip} -> 169.254.169.254:80`).sort());
+  assert.deepEqual(first.chain.slice(-2), platform, 'the platform rules are no longer the last ones');
+  assert.deepEqual(first.chain.slice(0, -2).sort(), expected.map(ruleOf).sort(), 'the rules above the drop');
+  // Single addresses only, on both sides, never a network.
+  const wide = first.chain.filter((l) => /-j ACCEPT/.test(l)).flatMap((l) => [...l.matchAll(/-[sd] (\S+)/g)].map((m) => m[1])).filter((a) => !a.endsWith('/32'));
+  assert.deepEqual(wide, [], 'an ACCEPT rule names a network');
+  // A second run finds them and changes nothing.
+  assert.equal(second.code, 0, second.out);
+  assert.deepEqual(second.out.split('\n').sort(), expected.map((ip) => `found: ${ip} -> 169.254.169.254:80`).sort());
+  assert.deepEqual(second.chain, first.chain, 'the second run changed the chain');
+  assert.deepEqual(second.calls.filter((c) => c.startsWith('-I')), [], 'the second run inserted a rule');
+  // A malformed or missing prefix stops before any call of iptables.
+  for (const name of Object.keys(bad)) {
+    const run = runs[`bad-${name}`];
+    assert.notEqual(run.code, 0, `${name}: the script went on`);
+    assert.deepEqual(run.calls, [], `${name}: iptables was called`);
+    assert.deepEqual(run.chain, first.chain, `${name}: the chain changed`);
+    assert.match(run.out, /APP_NET_PREFIX is missing or not three numbers from 0 to 255/, name);
+  }
+  // Without DOCKER-USER (Docker not running) it lists the chain and stops.
+  assert.notEqual(runs['no-chain'].code, 0, 'no-chain: the script went on');
+  assert.deepEqual(runs['no-chain'].calls, ['-n -L DOCKER-USER'], 'no-chain: more than the one look at the chain');
+  assert.match(runs['no-chain'].out, /DOCKER-USER does not exist/);
+});
+
+test('metadata endpoint: the systemd unit runs the script after Docker starts, at every boot and every Docker restart', () => {
+  const file = path.join(DEPLOY_DIR, 'systemd', 'goenn-metadata-access.service');
+  assert.ok(fs.existsSync(file), 'no deploy/systemd/goenn-metadata-access.service');
+  const unit = {};
+  let section = null;
+  for (const raw of readText(file).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    const head = /^\[(\w+)\]$/.exec(line);
+    if (head) { section = head[1]; unit[section] = {}; continue; }
+    const kv = /^(\w+)=(.*)$/.exec(line);
+    assert.ok(section && kv, `not a line of a unit: ${line}`);
+    (unit[section][kv[1]] ??= []).push(kv[2]);
+  }
+  console.log(`systemd unit: ${Object.keys(unit).join(', ')}`);
+  assert.deepEqual(Object.keys(unit), ['Unit', 'Service', 'Install']);
+  assert.deepEqual(unit.Unit.After, ['docker.service']);
+  assert.deepEqual(unit.Unit.Requires, ['docker.service']);
+  // Stopping or restarting Docker stops or restarts the unit too, and Docker's start pulls it in
+  // again (WantedBy): the script runs after every start of Docker, the boot included.
+  assert.deepEqual(unit.Unit.PartOf, ['docker.service']);
+  assert.deepEqual(unit.Install.WantedBy, ['docker.service']);
+  assert.deepEqual(unit.Service.Type, ['oneshot']);
+  assert.deepEqual(unit.Service.RemainAfterExit, ['yes']);
+  assert.deepEqual(unit.Service.ExecStart, ['/bin/bash @DEPLOY_DIR@/scripts/metadata-access.sh']);
+  assert.ok(fs.existsSync(path.join(DEPLOY_DIR, 'scripts', 'metadata-access.sh')), 'the script the unit runs');
+  // The runbook installs it with the placeholder replaced by the clone's deploy/ folder.
+  const runbook = readText(RUNBOOK).replace(/\r\n/g, '\n');
+  assert.match(runbook, /^ *sed "s\|@DEPLOY_DIR@\|\$\(pwd -P\)\|" systemd\/goenn-metadata-access\.service > \/etc\/systemd\/system\/goenn-metadata-access\.service$/m, 'the runbook does not install the unit');
+  assert.match(runbook, /^ *systemctl enable --now goenn-metadata-access\.service$/m, 'the runbook does not enable the unit');
 });
 
 test('the CI override closes every network, publishes no port and sends every mail to Mailpit', () => {

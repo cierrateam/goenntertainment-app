@@ -180,7 +180,7 @@ test('runbook: every pointer to a runbook section names one that exists', () => 
   };
   const files = [
     'deploy/docker-compose.yml', 'deploy/.env.example', 'deploy/Caddyfile', 'api/docker/entrypoint.sh',
-    ...folder('scripts'), ...folder('mysql'),
+    ...folder('scripts'), ...folder('mysql'), ...folder('systemd'),
   ].filter((f) => fs.existsSync(path.join(REPO_ROOT, f)));
   const pointers = [];
   for (const file of files) {
