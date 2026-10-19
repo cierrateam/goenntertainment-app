@@ -11,6 +11,14 @@
 #   - BACKUP_DIR is an absolute path to an existing directory OUTSIDE this clone (a fresh clone
 #     or a `git clean` must never take the backups with it), owned by root with mode 700 (the
 #     backup container writes as root without any capability);
+#   - ORIGIN_TLS_DIR is an existing directory outside this clone that only root can change, with
+#     the edge's three files as files of their own, not links
+#     (deploy/README.md, Origin certificate and Authenticated Origin Pulls): origin-key.pem
+#     belongs to root with mode 600 or 400 and holds a private key; only root can change
+#     origin-cert.pem and origin-pull-ca.pem, each holds a certificate that has not expired (an
+#     expired one fails every handshake with Cloudflare: 526 for the origin certificate, 525 for
+#     the CA), and origin-cert.pem names DOMAIN and belongs to the key. Run it as root: only root
+#     can read the key;
 #   - BACKUP_RETENTION_DAYS, MYSQL_BINLOG_RETENTION_DAYS, LOG_MAX_SIZE and LOG_MAX_FILES have a
 #     valid form (the backup and db services check the first two again when they start);
 #     LOG_MAX_FILES is at least 2: Docker's `local` log driver compresses the rotated files and
@@ -123,6 +131,113 @@ else
     pass 'BACKUP_DIR belongs to root with mode 700'
   else
     flunk "BACKUP_DIR belongs to root with mode 700 (it has uid and mode $owner_mode)"
+  fi
+fi
+
+# The edge's TLS files (deploy/README.md, Origin certificate and Authenticated Origin Pulls):
+# caddy reads them from ORIGIN_TLS_DIR as /etc/caddy/origin. Nothing of their content is printed;
+# the certificate and the key are compared through their public keys.
+
+# Owned by root, and nobody else may write it: no write bit for the group or others.
+root_only() {
+  local label=$1 path=$2 owner mode
+  read -r owner mode < <(stat -c '%u %a' -- "$path")
+  if [[ "$owner" == 0 ]] && (( (8#$mode & 8#022) == 0 )); then
+    pass "$label belongs to root and only root can change it"
+  else
+    flunk "$label belongs to root and only root can change it (it has uid and mode $owner $mode)"
+  fi
+}
+
+# A file of the folder, as a file of its own: a symbolic link would point to a path that does not
+# exist inside caddy's container. Returns 1 when it is not.
+tls_file() {
+  if [[ -f "$2" && ! -L "$2" ]]; then
+    pass "ORIGIN_TLS_DIR/$1 is a file, not a symbolic link"
+  else
+    flunk "ORIGIN_TLS_DIR/$1 is a file, not a symbolic link"
+    return 1
+  fi
+}
+
+# A certificate in PEM that has not expired. Returns 1 when the file holds no certificate.
+certificate() {
+  local name=$1 path=$2 expired=$3
+  if ! openssl x509 -in "$path" -noout 2>/dev/null; then
+    flunk "$name holds a certificate (PEM)"
+    return 1
+  fi
+  pass "$name holds a certificate"
+  if openssl x509 -in "$path" -noout -checkend 0 >/dev/null 2>&1; then
+    pass "$name has not expired"
+  else
+    flunk "$name has not expired ($expired)"
+  fi
+}
+
+tls_dir=$(setting ORIGIN_TLS_DIR)
+if ! command -v openssl >/dev/null 2>&1; then
+  flunk 'openssl is installed (the checks of the TLS files need it)'
+fi
+if [[ "$tls_dir" != /* ]]; then
+  flunk 'ORIGIN_TLS_DIR is an absolute path'
+elif [[ ! -d "$tls_dir" ]]; then
+  flunk 'ORIGIN_TLS_DIR is an existing directory (create it: install -d -m 700 -o root -g root <path>)'
+else
+  pass 'ORIGIN_TLS_DIR is an existing directory with an absolute path'
+  tls_real=$(realpath -e -- "$tls_dir")
+  if [[ "$tls_real" == "$clone" || "$tls_real" == "$clone"/* ]]; then
+    flunk 'ORIGIN_TLS_DIR lies outside this clone'
+  else
+    pass 'ORIGIN_TLS_DIR lies outside this clone'
+  fi
+  root_only ORIGIN_TLS_DIR "$tls_real"
+
+  # The key: the one secret here, readable by root alone.
+  key=$tls_real/origin-key.pem
+  if tls_file origin-key.pem "$key"; then
+    read -r owner mode < <(stat -c '%u %a' -- "$key")
+    if [[ "$owner" == 0 && ( "$mode" == 600 || "$mode" == 400 ) ]]; then
+      pass 'origin-key.pem belongs to root with mode 600 or 400'
+    else
+      flunk "origin-key.pem belongs to root with mode 600 or 400 (it has uid and mode $owner $mode)"
+    fi
+    if openssl pkey -in "$key" -noout 2>/dev/null; then
+      pass 'origin-key.pem holds a private key'
+    else
+      flunk 'origin-key.pem holds a private key (PEM; only root can read it, so run the preflight as root)'
+    fi
+  fi
+
+  # The origin certificate: Cloudflare checks it in SSL mode Full (strict) and answers 526 when it
+  # has expired or does not name DOMAIN.
+  cert=$tls_real/origin-cert.pem
+  if tls_file origin-cert.pem "$cert"; then
+    root_only origin-cert.pem "$cert"
+    if certificate origin-cert.pem "$cert" 'Cloudflare would answer 526'; then
+      # The output, not the exit code: whether openssl fails on a name that does not match depends
+      # on its version.
+      domain=$(setting DOMAIN)
+      if [[ -n "$domain" && "$(openssl x509 -in "$cert" -noout -checkhost "$domain" 2>/dev/null)" == *' does match certificate'* ]]; then
+        pass 'origin-cert.pem names DOMAIN'
+      else
+        flunk 'origin-cert.pem names DOMAIN (Cloudflare would answer 526)'
+      fi
+      cert_public=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null)
+      key_public=$(openssl pkey -in "$key" -pubout 2>/dev/null)
+      if [[ -n "$cert_public" && "$cert_public" == "$key_public" ]]; then
+        pass 'origin-cert.pem belongs to origin-key.pem'
+      else
+        flunk 'origin-cert.pem belongs to origin-key.pem (caddy would not start)'
+      fi
+    fi
+  fi
+
+  # The origin-pull CA: not secret, but whoever can change it decides who completes a handshake.
+  ca=$tls_real/origin-pull-ca.pem
+  if tls_file origin-pull-ca.pem "$ca"; then
+    root_only origin-pull-ca.pem "$ca"
+    certificate origin-pull-ca.pem "$ca" 'every handshake with Cloudflare would fail: 525'
   fi
 fi
 

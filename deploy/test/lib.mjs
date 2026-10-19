@@ -190,6 +190,46 @@ export function serviceImage(service) {
   return image;
 }
 
+/** The script that makes the throw-away certificates (this checkout's copy, whatever DEPLOY_DIR is). */
+export const THROWAWAY_PKI = path.join(REPO_ROOT, 'deploy', 'test', 'throwaway-pki.sh');
+
+/**
+ * A throw-away PKI in a temp folder, made by deploy/test/throwaway-pki.sh in the pinned db image
+ * (openssl, no network), in place of what Cloudflare and Cierra's private CA provide on a server.
+ * `edgeDir` holds what caddy loads from ORIGIN_TLS_DIR; `client` is what the stack test's probe
+ * presents and trusts in Cloudflare's place (deploy/test/probe.mjs). Valid for one day; remove()
+ * deletes the folder. The CA keys never leave the container.
+ */
+export function throwawayPki(domain) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'goenn-deploy-pki-'));
+  const remove = () => fs.rmSync(dir, { recursive: true, force: true });
+  // The script writes as root: in folders of this user's own, the files can be removed without root.
+  for (const sub of ['edge', 'cloudflare']) fs.mkdirSync(path.join(dir, sub));
+  const r = dockerRun(serviceImage('db'), {
+    mounts: [{ src: THROWAWAY_PKI, dst: '/opt/throwaway-pki.sh' }, { src: dir, dst: '/pki', readonly: false }],
+    entrypoint: 'sh',
+    args: ['/opt/throwaway-pki.sh', '/pki', domain],
+  });
+  if (r.status !== 0) {
+    remove();
+    throw new Error(`throwaway-pki.sh failed (exit ${r.status}): ${r.stderr.trim()}`);
+  }
+  const pem = (sub, name) => readText(path.join(dir, sub, name));
+  return {
+    dir,
+    edgeDir: path.join(dir, 'edge'),
+    originCert: pem('edge', 'origin-cert.pem'),
+    client: {
+      ca: pem('cloudflare', 'origin-ca.pem'),
+      identities: {
+        cloudflare: { cert: pem('cloudflare', 'client-cert.pem'), key: pem('cloudflare', 'client-key.pem') },
+        other: { cert: pem('cloudflare', 'other-cert.pem'), key: pem('cloudflare', 'other-key.pem') },
+      },
+    },
+    remove,
+  };
+}
+
 const adapted = new Map();
 
 /** `caddy adapt` of a Caddyfile in the pinned Caddy image: the JSON config, cached. */

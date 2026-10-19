@@ -2,16 +2,18 @@
 //
 // Builds the images, starts the whole stack of deploy/docker-compose.yml with the CI override and
 // deploy/ci.env the way the runbook's first start does (backends first, the admin gate, the
-// one-off seed, then the edge), checks it from the `probe` service (a visitor on the edge network,
-// deploy/test/probe.mjs) and from inside the containers, and removes it again with its volumes and
-// built images.
+// one-off seed, then the edge), checks it from the `probe` service (Cloudflare's part on the edge
+// network, deploy/test/probe.mjs) and from inside the containers, and removes it again with its
+// volumes and built images.
 //
 //   COMPOSE_PROJECT_NAME=<a name of its own> npm run test:deploy:stack
 //
 // Needs Docker with Compose >= 2.24.4. The image builds reach the container and package
-// registries; the stack itself runs on internal networks only: no certificate authority and no
-// mail provider is ever contacted (DOMAIN=localhost makes Caddy use its own internal certificate
-// authority). Settings: stack-lib.mjs (stackSettings).
+// registries; the stack itself runs on internal networks only, and no mail provider is ever
+// contacted. In place of Cloudflare and Cierra's private CA, the run makes throw-away
+// certificates (deploy/test/throwaway-pki.sh): the edge loads its origin certificate and the
+// origin-pull CA from them through ORIGIN_TLS_DIR, the probe presents the matching client
+// certificate. Settings: stack-lib.mjs (stackSettings).
 //
 // Every account, password and key here is made up for this run and never printed; answers are
 // shown through redact(). Usernames come from the server tests' fixtures (testIdentity), so the
@@ -24,7 +26,7 @@ import path from 'node:path';
 
 import { BLOCKED_TERMS, findBlockedTerm } from '../../server/src/blocked-terms.js';
 import { testIdentity, uniqueStamp } from '../../server/test/support/fixtures.js';
-import { REPO_ROOT, envFileValues, readText } from './lib.mjs';
+import { REPO_ROOT, envFileValues, readText, throwawayPki } from './lib.mjs';
 import {
   Stack, apiRequest, freshPassword, header, laravelLimit, multipart, png, redact, sha256,
   stackSettings, storageList, waitFor,
@@ -167,6 +169,8 @@ function imageUpload(urlPath, token, fields, field, bytes) {
 
 before(async () => {
   try {
+    // The certificates Cloudflare and Cierra's CA provide on a server, made for this run only.
+    stack.usePki(step('certificates', () => throwawayPki(domain)));
     await start();
   } catch (err) {
     S.failed = true;
@@ -214,8 +218,8 @@ async function start() {
   S.caddyAfter = await waitFor('caddy to run', () => (stateOf('caddy').running ? stateOf('caddy') : null), { ms: 120_000 })
     .catch(() => stateOf('caddy'));
 
-  // Three visitors with three addresses on the edge network; the third one only for the rate
-  // limit check, so it starts with empty counters.
+  // Three probes with three addresses on the edge network, like three of Cloudflare's edge nodes;
+  // the third one sends only the rate limit check's requests.
   const probes = step('probes', () => stack.compose(['up', '-d', '--scale', 'probe=3', 'probe'], { profiles: ['test'] }));
   if (probes.status !== 0) throw new Error(`cannot start the probe service (exit ${probes.status}): ${tail(probes.stderr)}`);
   await waitFor('the edge to answer /api/health', () => {
@@ -235,10 +239,12 @@ after(() => {
     console.log(`--- logs of the stack (last 200 lines per container) ---\n${logs.stdout}${logs.stderr}`);
   }
   if (settings.keep) {
-    console.log(`STACK_KEEP=1: the stack ${stack.project} keeps running; remove it with docker compose -p ${stack.project} down -v`);
+    console.log(`STACK_KEEP=1: the stack ${stack.project} keeps running; remove it with docker compose -p ${stack.project} down -v, `
+      + `then its throw-away certificates in ${stack.pki?.dir ?? '(none were made)'}`);
   } else {
     const down = stack.compose(['down', '-v', '--remove-orphans', '--rmi', 'local'], { profiles: ['tools', 'test'] });
     console.log(`down -v --remove-orphans --rmi local: exit ${down.status}`);
+    stack.pki?.remove();
   }
   console.log(`stack test: ${Math.round((Date.now() - started) / 1000)} s`);
 }, { timeout: 5 * 60_000 });
@@ -286,6 +292,40 @@ check('F-18: the database healthcheck carries no password', () => {
   assert.equal(secrets.filter((v) => text.includes(v)).length, 0, 'the healthcheck holds a password value');
   assert.doesNotMatch(text, /(^|\s)(-p\S|--password)|MYSQL_PWD|MYSQL_(ROOT_)?PASSWORD/, 'the healthcheck names a password option');
   assert.equal(db.State.Health?.Status, 'healthy');
+});
+
+// --------------------------------------------------------------------------- the edge behind Cloudflare
+
+check('Authenticated Origin Pulls: the edge completes a TLS handshake only with the client certificate of the origin-pull CA, under any name', () => {
+  // The edge's certificate as this run made it: the one the probe must see when it checks the
+  // edge the way Cloudflare's SSL mode Full (strict) does.
+  const expected = new crypto.X509Certificate(stack.pki.originCert).fingerprint256;
+  const other = `x.${domain}`;
+  const cases = [
+    ['no client certificate, the domain', { identity: 'none' }],
+    [`no client certificate, ${other} (under the wildcard of the origin certificate)`, { identity: 'none', servername: other, headers: { Host: other } }],
+    ['no client certificate, no server name', { identity: 'none', servername: null }],
+    ['a client certificate of another CA', { identity: 'other' }],
+    [`the right client certificate, ${other}`, { servername: other, headers: { Host: other } }],
+    ['the right client certificate, the domain', {}],
+  ];
+  const res = stack.probe(cases.map(([, spec]) => ({ ...apiRequest('GET', '/api/health'), ...spec, headers: { Accept: 'application/json', ...(spec.headers ?? {}) } }))).results;
+  console.log(`handshakes: ${cases.map(([label], i) => `${label}: ${res[i].error ?? res[i].status}`).join('; ')}`);
+  // Refused: no answer at all, only a TLS alert or a closed connection.
+  const answered = cases.slice(0, -1).map(([label], i) => ({ label, r: res[i] })).filter(({ r }) => !r.error || r.status !== undefined)
+    .map(({ label, r }) => `${label}: ${r.status ?? r.error}`);
+  assert.deepEqual(answered, [], 'the edge answered without the right client certificate and name');
+  const ok = res.at(-1);
+  assert.equal(ok.status, 200, `with the client certificate: ${redact(ok)}`);
+  assert.equal(ok.certSha256, expected, 'the edge presented another certificate than the one in ORIGIN_TLS_DIR');
+});
+
+check('the edge listens on 443 only: nothing answers on port 80', () => {
+  const [port80, port443] = stack.probe([{ connect: 80 }, { connect: 443 }]).results;
+  console.log(`ports: 80 ${port80.connected ? 'open' : port80.error}, 443 ${port443.connected ? 'open' : port443.error}`);
+  assert.equal(port443.connected, true, 'the control: 443 does not answer either');
+  assert.equal(port80.connected, false, 'something listens on port 80');
+  assert.equal(port80.error, 'ECONNREFUSED');
 });
 
 // --------------------------------------------------------------------------- the Laravel image
@@ -398,7 +438,7 @@ check('F-29: a PHP file planted in any upload folder is never executed, through 
   }
 });
 
-check('F-29/F-30: a stored image is a plain file with nosniff and a sandbox CSP; private media are never served as files', () => {
+check('F-29/F-30: a stored image is a plain file with nosniff, a sandbox CSP and five minutes in a cache; private media are never served as files', () => {
   const bytes = png([0x20, 0x90, 0x60]);
   const name = storedName('png');
   const pub = storageList('PUBLIC_FOLDERS');
@@ -416,14 +456,17 @@ check('F-29/F-30: a stored image is a plain file with nosniff and a sandbox CSP;
       assert.equal(header(r, 'content-type'), 'image/png', urls[i]);
       assert.equal(header(r, 'x-content-type-options'), 'nosniff', urls[i]);
       assert.match(header(r, 'content-security-policy') ?? '', /default-src 'none'.*sandbox|sandbox.*default-src 'none'/, urls[i]);
+      // Cloudflare caches images by their extension: a removed one leaves its cache in five minutes.
+      assert.deepEqual(directives(header(r, 'cache-control')), ['max-age=300', 'public'], `${urls[i]}: Cache-Control ${header(r, 'cache-control')}`);
       assert.equal(r.bodySha256, sha256(bytes), `${urls[i]}: not the stored bytes`);
     });
     priv.forEach((f, j) => {
       const r = res[pub.length + j];
       assert.ok(r.status >= 400 && r.status < 500, `${urls[pub.length + j]} answered ${r.status ?? r.error}`);
       assert.notEqual(r.bodySha256, sha256(bytes), `${urls[pub.length + j]} was served`);
+      assert.ok(!directives(header(r, 'cache-control')).includes('public'), `${urls[pub.length + j]}: Cache-Control ${header(r, 'cache-control')}`);
     });
-    // The files come from media, read-only; the edge, which holds the keys, mounts no upload.
+    // The files come from media, read-only; the edge, which holds the origin key, mounts no upload.
     const caddyMounts = stack.containersOf('caddy')[0]?.Mounts ?? [];
     const mediaMounts = stack.containersOf('media')[0]?.Mounts ?? [];
     const named = (list, re) => list.filter((m) => re.test(m.Name ?? '')).map((m) => m.Destination);
@@ -477,18 +520,18 @@ check("F-11: an evidence image leaves the server only through Laravel's admin ro
   assert.notEqual(stack.exec('caddy', ['test', '-e', `/srv/storage/evidence/${file}`]).status, 0, 'caddy can see the evidence image');
 });
 
-check('uploads: a symbolic link planted in the uploads volume never hands out the edge\'s private keys', () => {
+check('uploads: a symbolic link planted in the uploads volume never hands out the edge\'s origin key or certificate', () => {
   // Caddy's file server follows links, and an allowed name is all a link needs. The edge holds
-  // the certificate and account keys (caddy-data; in CI the keys of Caddy's internal authority
-  // for DOMAIN=localhost), so the links point there: absolute, and relative from the folder.
+  // the origin certificate's key (ORIGIN_TLS_DIR, mounted at /etc/caddy/origin), so the links
+  // point there: absolute, and relative from the folder.
   const where = roots();
   const keys = [
-    { folder: 'partners', target: '/data/caddy/pki/authorities/local/root.key' },
-    { folder: 'offers', target: `/data/caddy/certificates/local/${domain}/${domain}.key` },
-    { folder: 'avatars', target: '/data/caddy/pki/authorities/local/intermediate.key', relative: '../../../data/caddy/pki/authorities/local/intermediate.key' },
+    { folder: 'partners', target: '/etc/caddy/origin/origin-key.pem' },
+    { folder: 'offers', target: '/etc/caddy/origin/origin-cert.pem' },
+    { folder: 'avatars', target: '/etc/caddy/origin/origin-key.pem', relative: '../../../etc/caddy/origin/origin-key.pem' },
   ];
-  // The keys exist at the edge: a 404 below is a refusal, not a missing target. Only a hash of
-  // each key leaves the container, never the key.
+  // The files exist at the edge: a 404 below is a refusal, not a missing target. Only a hash of
+  // each file leaves the container, never the key.
   const hashes = keys.map((k) => {
     const r = stack.sh('caddy', `test -f '${k.target}' && sha256sum '${k.target}' | cut -d' ' -f1`);
     assert.equal(r.status, 0, `the edge has no ${k.target}: the check would prove nothing`);
@@ -508,9 +551,9 @@ check('uploads: a symbolic link planted in the uploads volume never hands out th
     const served = links.map((l, i) => ({ l, r: res[i], hash: hashes[i] }))
       .filter(({ r, hash }) => r.error || r.status !== 404 || r.bodySha256 === hash || /PRIVATE KEY/.test(r.body ?? ''))
       // Status and what was found only: never the body.
-      .map(({ l, r, hash }) => `${l.relative ? 'relative' : 'absolute'} link to ${l.target}: ${r.status ?? r.error}, the key's bytes ${r.bodySha256 === hash ? 'served' : 'not served'}, PRIVATE KEY in the body: ${/PRIVATE KEY/.test(r.body ?? '')}`);
-    console.log(`planted links: ${links.length} (${links.filter((l) => l.relative).length} relative) to the edge's keys, answers ${JSON.stringify(tally(res.slice(0, links.length)))}; control file ${res.at(-1).status}`);
-    assert.deepEqual(served, [], "the edge's private keys were served through a planted link");
+      .map(({ l, r, hash }) => `${l.relative ? 'relative' : 'absolute'} link to ${l.target}: ${r.status ?? r.error}, the file's bytes ${r.bodySha256 === hash ? 'served' : 'not served'}, PRIVATE KEY in the body: ${/PRIVATE KEY/.test(r.body ?? '')}`);
+    console.log(`planted links: ${links.length} (${links.filter((l) => l.relative).length} relative) to the edge's TLS files, answers ${JSON.stringify(tally(res.slice(0, links.length)))}; control file ${res.at(-1).status}`);
+    assert.deepEqual(served, [], "the edge's TLS files were served through a planted link");
     const ctl = res.at(-1);
     assert.equal(ctl.status, 200, `a stored file next to the links: ${ctl.status ?? ctl.error}`);
     assert.equal(ctl.bodySha256, sha256(control.bytes), 'the control file is not the stored bytes');
@@ -524,7 +567,7 @@ check('uploads: a symbolic link planted in the uploads volume never hands out th
 
 // --------------------------------------------------------------------------- headers
 
-check('F-30: every kind of answer carries the security headers, and http redirects to https', () => {
+check('F-30: every kind of answer carries the security headers, and only the uploads may be cached', () => {
   const png1 = png([0x11, 0x22, 0x33]);
   const name = storedName('png');
   const where = roots();
@@ -562,6 +605,12 @@ check('F-30: every kind of answer carries the security headers, and http redirec
       'Permissions-Policy': (r) => /camera=\(\)/.test(header(r, 'permissions-policy') ?? '') && /geolocation=\(\)/.test(header(r, 'permissions-policy') ?? ''),
       'no Server header': (r) => header(r, 'server') === undefined,
       'no X-Powered-By header': (r) => header(r, 'x-powered-by') === undefined,
+      // Cloudflare caches .jpg, .png and .webp by extension: the uploads say five minutes, and
+      // nothing else may be kept by a shared cache.
+      'Cache-Control (public, max-age=300 on the uploads only)': (r, kind) => {
+        const cc = directives(header(r, 'cache-control'));
+        return kind === 'upload' ? JSON.stringify(cc) === JSON.stringify(['max-age=300', 'public']) : !cc.includes('public');
+      },
     };
     const problems = [];
     kinds.forEach(([label, , status, kind], i) => {
@@ -571,10 +620,6 @@ check('F-30: every kind of answer carries the security headers, and http redirec
     });
     console.log(`headers: ${kinds.length} kinds of answer x ${Object.keys(rules).length} rules = ${kinds.length * Object.keys(rules).length} checks`);
     assert.deepEqual(problems, []);
-
-    const redirect = stack.request({ method: 'GET', path: '/api/health', scheme: 'http' });
-    assert.ok([301, 308].includes(redirect.status), `http answered ${redirect.status ?? redirect.error}`);
-    assert.equal(header(redirect, 'location'), `https://${domain}/api/health`);
   } finally {
     remove('api', [`${where.uploads}/avatars/${name}`]);
   }
@@ -764,7 +809,7 @@ check('F-09: the reset code mail reaches the CI mail catcher, the code works onc
   assert.deepEqual(leaks, []);
 });
 
-check("F-31: Laravel's per-address limit counts the visitor's own address, and a client-sent X-Forwarded-For changes nothing", () => {
+check("F-31: Laravel's per-address limit counts the address Cloudflare sends in CF-Connecting-IP, never the edge's TCP peer or a client-sent X-Forwarded-For, and the access log records it", async () => {
   // The password-forgot limiter counts per address and per account (api/config/ratelimits.php);
   // every request names another address of its own, so only the per-address counter fills.
   const spec = laravelLimit('password-forgot', 'ip');
@@ -774,37 +819,66 @@ check("F-31: Laravel's per-address limit counts the visitor's own address, and a
   const windowMs = Number(m[2]) * 1000;
   const stamp = crypto.randomBytes(4).toString('hex');
   let n = 0;
-  const forgot = () => {
+  /** A forgot-password request as Cloudflare forwards it: the visitor's address in CF-Connecting-IP. */
+  const forgot = (visitor, headers = {}) => {
     n += 1;
-    return apiRequest('POST', '/api/forgot-password', { json: { email: `f31-${stamp}-${n}@example.invalid` } });
+    const r = apiRequest('POST', '/api/forgot-password', { json: { email: `f31-${stamp}-${n}@example.invalid` } });
+    return { ...r, headers: { ...r.headers, 'CF-Connecting-IP': visitor, ...headers } };
   };
-  const forged = (address) => {
-    const r = forgot();
-    return { ...r, headers: { ...r.headers, 'X-Forwarded-For': address } };
-  };
+  // Addresses of the documentation ranges, unused by every other check.
+  const A = '203.0.113.31';
+  const B = '198.51.100.31';
+  const forgedFor = '192.0.2.31';
+  const v6 = ['2001:db8:31:1::1', '2001:db8:31:1:ffff:ffff:ffff:ffff', '2001:db8:31:2::1'];
 
-  // Visitor A is the third probe, which sent nothing before: its counter starts empty.
+  // One probe plays one Cloudflare edge node: every request below comes from the same TCP peer.
   const t0 = Date.now();
-  const a = stack.probe([...Array.from({ length: max }, forgot), forgot(), forged('203.0.113.7')], { index: 3 });
-  const b = stack.probe([forgot(), forged(a.address[0])], { index: 1 });
-  const aAgain = stack.request(forgot(), 3);
+  const peer = stack.probe([
+    ...Array.from({ length: max }, () => forgot(A)),
+    forgot(A),
+    forgot(A, { 'X-Forwarded-For': forgedFor }),
+    forgot(B),
+    forgot(B, { 'X-Forwarded-For': A }),
+    ...Array.from({ length: max }, () => forgot(v6[0])),
+    forgot(v6[1]),
+    forgot(v6[2]),
+    { ...apiRequest('GET', `/api/health?f31=${stamp}`), headers: { Accept: 'application/json', 'CF-Connecting-IP': A } },
+  ], { index: 3 });
+  // Another edge node (another TCP peer) with visitor A.
+  const otherPeer = stack.probe([forgot(A)], { index: 1 });
   const elapsed = Date.now() - t0;
-  const burst = a.results.slice(0, max);
-  const [over, overForged] = a.results.slice(max);
-  const [bPlain, bAsA] = b.results;
-  const counts = burst.reduce((acc, r) => ({ ...acc, [r.status ?? r.error]: (acc[r.status ?? r.error] ?? 0) + 1 }), {});
-  console.log(`limit ${spec}: visitor A ${a.address.join(',')} sent ${max} (${JSON.stringify(counts)}), then ${over.status}, forged ${overForged.status}; `
-    + `visitor B ${b.address.join(',')}: ${bPlain.status}, claiming A's address ${bAsA.status}; A again ${aAgain.status}; ${elapsed} ms`);
-  assert.notEqual(a.address[0], b.address[0], 'the two visitors share an address');
-  assert.equal(counts[429] ?? 0, 0, 'limited before the limit');
-  assert.deepEqual(Object.keys(counts), ['200'], `answers inside the limit: ${JSON.stringify(counts)}`);
+
+  const res = peer.results;
+  const burst = res.slice(0, max);
+  const [overA, forgedA, plainB, bClaimsA] = res.slice(max, max + 4);
+  const v6Burst = res.slice(max + 4, 2 * max + 4);
+  const [sameSlash64, nextSlash64] = res.slice(2 * max + 4, 2 * max + 6);
+  const [aFromOtherPeer] = otherPeer.results;
+  console.log(`limit ${spec}: one peer ${peer.address.join(',')}: A ${JSON.stringify(tally(burst))} then ${overA.status}, with a forged X-Forwarded-For ${forgedA.status}; `
+    + `B ${plainB.status}, B claiming A ${bClaimsA.status}; IPv6 ${JSON.stringify(tally(v6Burst))}, same /64 ${sameSlash64.status}, next /64 ${nextSlash64.status}; `
+    + `A from another peer ${otherPeer.address.join(',')}: ${aFromOtherPeer.status}; ${elapsed} ms`);
+  assert.notEqual(peer.address[0], otherPeer.address[0], 'the two edge nodes share an address');
   assert.ok(elapsed < windowMs, `the checks took ${elapsed} ms, longer than the limit's window: the result proves nothing`);
-  assert.equal(over.status, 429, 'one more than the limit from the same address');
-  assert.match(over.json?.message ?? '', /Zu viele Versuche/, "the 429 is not Laravel's");
-  assert.equal(overForged.status, 429, 'a forged X-Forwarded-For moved visitor A into another bucket');
-  assert.notEqual(bPlain.status, 429, "visitor B is counted in A's bucket: Laravel does not count the visitor's own address");
-  assert.notEqual(bAsA.status, 429, "visitor B claiming A's address in X-Forwarded-For was counted as A");
-  assert.equal(aAgain.status, 429, "A's window had closed before B's checks: the result proves nothing");
+  assert.deepEqual(Object.keys(tally(burst)), ['200'], 'A was limited inside the limit');
+  assert.equal(overA.status, 429, 'one more than the limit for A');
+  assert.match(overA.json?.message ?? '', /Zu viele Versuche/, "the 429 is not Laravel's");
+  assert.equal(forgedA.status, 429, 'a client-sent X-Forwarded-For moved A into another bucket');
+  assert.notEqual(plainB.status, 429, "B, from the same TCP peer, is counted in A's bucket: Laravel counts the peer, not CF-Connecting-IP");
+  assert.notEqual(bClaimsA.status, 429, "B claiming A's address in X-Forwarded-For was counted as A");
+  assert.deepEqual(Object.keys(tally(v6Burst)), ['200'], 'an IPv6 visitor was limited inside the limit');
+  assert.equal(sameSlash64.status, 429, 'another address of the same /64 has a bucket of its own');
+  assert.notEqual(nextSlash64.status, 429, 'the next /64 shares the bucket');
+  assert.equal(aFromOtherPeer.status, 429, "A's bucket did not follow A to another edge node");
+
+  // The access log line of the tagged request: the visitor's address next to the edge node's.
+  const line = await waitFor('the tagged request in the access log', () => {
+    const logs = stack.compose(['logs', '--no-color', 'caddy']).stdout.split(/\r?\n/);
+    return logs.find((l) => l.includes(`f31=${stamp}`));
+  }, { ms: 30_000 });
+  const entry = JSON.parse(line.slice(line.indexOf('{')));
+  console.log(`access log: client_ip ${entry.request?.client_ip}, remote_ip ${entry.request?.remote_ip}`);
+  assert.equal(entry.request?.client_ip, A, 'the access log does not record the visitor\'s address');
+  assert.equal(entry.request?.remote_ip, peer.address[0], 'the access log does not record the edge node\'s address');
 });
 
 check('account deletion: Laravel deletes the account, and its token opens nothing afterwards', () => {

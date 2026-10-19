@@ -13,10 +13,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
-  CI_ENV, CI_OVERRIDE, COMPOSE_FILE, DEPLOY_DIR, ENV_EXAMPLE, REPO_ROOT, RUNBOOK,
+  CI_ENV, CI_OVERRIDE, COMPOSE_FILE, DEPLOY_DIR, ENV_EXAMPLE, REPO_ROOT, RUNBOOK, THROWAWAY_PKI,
   caddyAdapt, caddyHandlers, composeAsync, dockerRun, envFileValues, inCidr, interpolations,
   ipToInt, minimalEnv, mounts, parseEnvFile, readText, removeTemp, renderConfig, requiredSettings,
-  serviceImage, variantEnvFile,
+  serviceImage, throwawayPki, variantEnvFile,
 } from './lib.mjs';
 
 const composeText = () => readText(path.join(DEPLOY_DIR, COMPOSE_FILE));
@@ -50,6 +50,7 @@ const posix = (p) => String(p).replaceAll('\\', '/');
  */
 const REQUIRED = {
   DOMAIN: 'decision',
+  ORIGIN_TLS_DIR: 'technical',
   DB_PASSWORD: 'secret',
   DB_ROOT_PASSWORD: 'secret',
   APP_KEY: 'secret',
@@ -496,9 +497,10 @@ test('F-29: uploads are mounted read-only into media, read-write into api outsid
   assert.match(conf, new RegExp(`<Directory ${parent.replaceAll('/', '\\/')}>\\s*AllowOverride None\\s*Options None\\s*Require all denied\\s*php_admin_flag engine off\\s*</Directory>`), `api/docker/apache.conf does not refuse ${parent}`);
 });
 
-test('F-29: caddy, which holds the certificate and account keys, mounts no volume another service mounts', () => {
+test('F-29: caddy, which holds the origin key, mounts no volume another service mounts', () => {
   // Caddy follows symbolic links: a link planted in a volume someone else writes would let caddy
-  // serve its own files (caddy-data) under an allowed name. So it shares no volume at all.
+  // serve its own files (the origin key in /etc/caddy/origin) under an allowed name. So it shares
+  // no volume at all.
   const all = mounts(base());
   const own = all.filter((m) => m.service === 'caddy' && m.type === 'volume');
   console.log(`caddy: ${own.length} volumes (${own.map((m) => m.source).join(', ')}), ${all.length} mounts of the compose checked`);
@@ -506,8 +508,35 @@ test('F-29: caddy, which holds the certificate and account keys, mounts no volum
   assert.deepEqual(own.map((m) => m.source).sort(), ['caddy-config', 'caddy-data']);
   const shared = all.filter((m) => m.service !== 'caddy' && own.some((o) => o.source === m.source));
   assert.deepEqual(shared.map((m) => `${m.service}: ${m.source}`), [], 'a volume of caddy is mounted elsewhere');
-  const binds = all.filter((m) => m.service === 'caddy' && m.type === 'bind').map((m) => `${posix(m.source).split('/').pop()} -> ${m.target}:${m.read_only ? 'ro' : 'rw'}`);
-  assert.deepEqual(binds, ['Caddyfile -> /etc/caddy/Caddyfile:ro']);
+  const binds = all.filter((m) => m.service === 'caddy' && m.type === 'bind').map((m) => `${m.target}:${m.read_only ? 'ro' : 'rw'}`);
+  assert.deepEqual(binds.sort(), ['/etc/caddy/Caddyfile:ro', '/etc/caddy/origin:ro'], "caddy's binds: the Caddyfile and the TLS folder, both read-only");
+});
+
+test('edge: the origin certificate files come from the required ORIGIN_TLS_DIR bind, read-only, never created implicitly, into caddy only', () => {
+  const all = mounts(base());
+  const origin = all.filter((m) => m.target === '/etc/caddy/origin');
+  assert.deepEqual(origin.map((m) => `${m.service}:${m.type}:${m.read_only ? 'ro' : 'rw'}`), ['caddy:bind:ro']);
+  assert.equal(posix(origin[0].source).replace(/^[A-Za-z]:/, ''), ciValues().ORIGIN_TLS_DIR, 'the bind source is ORIGIN_TLS_DIR');
+  // Rendered, create_host_path depends on the docker compose version (see the BACKUP_DIR bind);
+  // the compose file itself must say it, in the long syntax.
+  assert.ok([undefined, false].includes(origin[0].bind?.create_host_path), `the ORIGIN_TLS_DIR bind renders create_host_path: ${JSON.stringify(origin[0].bind?.create_host_path)}`);
+  assert.match(
+    serviceText('caddy'),
+    /^ *- type: bind\n *source: \$\{ORIGIN_TLS_DIR:\?[^\n]*\}\n *target: \/etc\/caddy\/origin\n *read_only: true\n *bind:\n *create_host_path: false *$/m,
+    `deploy/${COMPOSE_FILE}: caddy's /etc/caddy/origin bind must be written in the long syntax, read-only, with create_host_path: false`,
+  );
+  // Nobody else sees the folder, under any name: the setting appears once in the compose, in
+  // caddy's service, and no other mount renders to its path.
+  const uses = composeText().split(/\r?\n/).filter((l) => !/^\s*#/.test(l) && l.includes('${ORIGIN_TLS_DIR'));
+  assert.equal(uses.length, 1, `ORIGIN_TLS_DIR is used ${uses.length} times in deploy/${COMPOSE_FILE}`);
+  assert.ok(serviceText('caddy').includes(uses[0]), 'ORIGIN_TLS_DIR is used outside the caddy service');
+  const sameSource = all.filter((m) => m.service !== 'caddy' && posix(m.source ?? '') === posix(origin[0].source));
+  assert.deepEqual(sameSource.map((m) => `${m.service}: ${m.target}`), [], 'another service mounts ORIGIN_TLS_DIR');
+  // The edge reads exactly these files from it (deploy/Caddyfile).
+  const caddyfile = readText(path.join(DEPLOY_DIR, 'Caddyfile'));
+  const files = [...new Set([...caddyfile.matchAll(/\/etc\/caddy\/origin\/([\w.-]+)/g)].map((m) => m[1]))].sort();
+  console.log(`ORIGIN_TLS_DIR: mounted into caddy only, read-only; the Caddyfile reads ${files.join(', ')}`);
+  assert.deepEqual(files, ['origin-cert.pem', 'origin-key.pem', 'origin-pull-ca.pem']);
 });
 
 /**
@@ -535,10 +564,22 @@ test('F-29: caddy passes only stored public images to the media file server and 
   for (const folder of privateFolders) assert.ok(!expected.includes(folder), `private folder ${folder} is served`);
   const upload = caddyHandlers(routes[uploadAt]);
   assert.deepEqual(upload.map((h) => h.handler), ['subroute', 'headers', 'reverse_proxy']);
-  // Set when the answer is written: the sandbox policy is sent whatever the file server answers.
+  // Set when the answer is written: the sandbox policy and the cache lifetime are sent whatever
+  // the file server answers.
   assert.equal(upload[1].response.deferred, true, 'the upload policy is not deferred');
   assert.match(upload[1].response.set['Content-Security-Policy'][0], /default-src 'none'.*sandbox/);
+  // Cloudflare caches .jpg, .png and .webp by extension (120 minutes when the origin says
+  // nothing): five minutes, so a removed image leaves its cache within that time.
+  assert.deepEqual(upload[1].response.set['Cache-Control'], ['public, max-age=300']);
   assert.deepEqual(upload[2].upstreams.map((u) => u.dial), ['media:8080']);
+  // No other route and no error route of the edge says anything about caching: Laravel's
+  // answers keep their own Cache-Control (no-cache, private; the ban evidence no-store, private).
+  const isCacheControl = (name) => name.toLowerCase() === 'cache-control';
+  const setsCacheControl = (h) => [h.response, h.headers?.response].some((ops) => ['set', 'add', 'replace'].some((op) => Object.keys(ops?.[op] ?? {}).some(isCacheControl)))
+    || (h.handler === 'static_response' && Object.keys(h.headers ?? {}).some(isCacheControl));
+  const setters = caddyHandlers(caddyAdapt()).filter(setsCacheControl);
+  assert.equal(setters.length, 1, `handlers that set Cache-Control: ${setters.length}`);
+  assert.equal(setters[0], upload[1], 'Cache-Control is set elsewhere than on the upload route');
   assert.deepEqual(caddyHandlers(routes[storageAt]).map((h) => [h.handler, h.status_code ?? null]), [['subroute', null], ['static_response', 404]]);
   assert.equal(routes[storageAt].match[0].path.includes('/storage'), true);
   assert.deepEqual(caddyHandlers(caddyAdapt()).filter((h) => h.handler === 'file_server'), [], 'the edge serves files itself');
@@ -592,12 +633,23 @@ test('F-29: media is a file server without secrets: no settings, no keys, nobody
 // ------------------------------------------------------------------------------ F-30
 
 test('F-30: the Caddyfile validates and sets the security headers on normal and error routes', () => {
-  const r = dockerRun(serviceImage('caddy'), {
-    mounts: [{ src: path.join(DEPLOY_DIR, 'Caddyfile'), dst: '/etc/caddy/Caddyfile' }],
-    env: { DOMAIN: 'localhost' },
-    args: ['caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'],
-  });
-  assert.equal(r.status, 0, r.stderr);
+  // `caddy validate` loads the certificate, its key and the client CA: with throw-away files,
+  // mounted where the compose mounts ORIGIN_TLS_DIR.
+  const pki = throwawayPki('localhost');
+  try {
+    const r = dockerRun(serviceImage('caddy'), {
+      mounts: [
+        { src: path.join(DEPLOY_DIR, 'Caddyfile'), dst: '/etc/caddy/Caddyfile' },
+        { src: pki.edgeDir, dst: '/etc/caddy/origin' },
+      ],
+      env: { DOMAIN: 'localhost' },
+      args: ['caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'],
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout + r.stderr, /Valid configuration/);
+  } finally {
+    pki.remove();
+  }
 
   const server = caddyAdapt().apps.http.servers.srv0;
   const places = { routes: server.routes, 'error routes': server.errors?.routes };
@@ -618,11 +670,57 @@ test('F-30: the Caddyfile validates and sets the security headers on normal and 
   }
 });
 
-test("F-31: caddy sends the client's TCP address to Laravel and overwrites a client-sent X-Forwarded-For", () => {
+test("F-31: caddy takes the visitor's address from CF-Connecting-IP and sets every forwarding header Laravel trusts", () => {
+  const server = caddyAdapt().apps.http.servers.srv0;
+  // CF-Connecting-IP from any source: safe only because no handshake completes without
+  // Cloudflare's client certificate ("every TLS connection policy requires ..." below).
+  assert.deepEqual(server.trusted_proxies, { ranges: ['0.0.0.0/0', '::/0'], source: 'static' });
+  assert.deepEqual(server.client_ip_headers, ['CF-Connecting-IP']);
+  // Laravel trusts For, Host and Proto from caddy (api/bootstrap/app.php; TRUSTED_PROXIES is
+  // caddy's address). With every source trusted, caddy would pass on what a client sent: it SETS
+  // each of the three instead.
+  const bootstrap = readText(path.join(REPO_ROOT, 'api', 'bootstrap', 'app.php'));
+  const trusted = /trustProxies\(\s*headers:\s*([^,]+),/.exec(bootstrap)?.[1].match(/HEADER_X_FORWARDED_[A-Z]+/g)?.sort();
+  assert.deepEqual(trusted, ['HEADER_X_FORWARDED_FOR', 'HEADER_X_FORWARDED_HOST', 'HEADER_X_FORWARDED_PROTO'], 'the forwarding headers Laravel trusts');
   const proxy = edgeProxies().api ?? [];
   assert.equal(proxy.length, 1);
-  assert.deepEqual(proxy[0].headers?.request?.set?.['X-Forwarded-For'], ['{http.request.remote.host}']);
-  assert.deepEqual(proxy[0].headers?.request?.set?.['X-Forwarded-Proto'], ['{http.request.scheme}']);
+  const set = proxy[0].headers?.request?.set ?? {};
+  assert.deepEqual(set['X-Forwarded-For'], ['{http.vars.client_ip}'], 'the address Caddy took from CF-Connecting-IP');
+  assert.deepEqual(set['X-Forwarded-Host'], ['{http.request.host}']);
+  assert.deepEqual(set['X-Forwarded-Proto'], ['{http.request.scheme}']);
+});
+
+test('edge: every TLS connection policy requires the client certificate of the origin-pull CA; 443 only, no ACME, and no setting reaches it', () => {
+  const config = caddyAdapt();
+  const servers = Object.values(config.apps.http.servers);
+  assert.equal(servers.length, 1, 'the edge runs one server');
+  const [server] = servers;
+  assert.deepEqual(server.listen, [':443'], 'the edge listens on 443 only');
+  assert.equal(server.automatic_https?.disable, true, 'automatic HTTPS (ACME and the port-80 redirect) is on');
+  assert.equal(server.strict_sni_host, true, 'the Host header may differ from the TLS server name');
+  assert.deepEqual(server.protocols, ['h1', 'h2'], 'HTTP/3 would listen on UDP 443');
+  // Every policy, the catch-all for other names and for a handshake without a name included.
+  const policies = server.tls_connection_policies ?? [];
+  const ca = JSON.stringify({ pem_files: ['/etc/caddy/origin/origin-pull-ca.pem'], provider: 'file' });
+  console.log(`edge: ${policies.length} TLS connection policies (${policies.map((p) => p.match?.sni?.join(',') ?? 'any other name, or none').join('; ')})`);
+  const open = policies.filter((p) => p.client_authentication?.mode !== 'require_and_verify' || JSON.stringify(p.client_authentication?.ca) !== ca);
+  assert.deepEqual(open.map((p) => JSON.stringify(p)), [], 'a TLS policy that completes a handshake without the client certificate');
+  assert.deepEqual(policies.map((p) => p.match?.sni ?? null), [['localhost'], null], 'one policy for DOMAIN and one for every other name');
+  // The site for every other name answers nothing: it closes the connection.
+  const routes = server.routes;
+  assert.deepEqual(routes.map((r) => r.match?.[0]?.host ?? null), [['localhost'], null]);
+  assert.deepEqual(caddyHandlers(routes[1]).map((h) => [h.handler, h.abort ?? null]), [['subroute', null], ['static_response', true]]);
+  // The certificate pair is the files of ORIGIN_TLS_DIR; nothing is fetched, issued or stapled.
+  const tls = config.apps.tls;
+  assert.deepEqual(Object.keys(tls.certificates ?? {}), ['load_files'], 'certificates from somewhere else');
+  assert.deepEqual(tls.certificates.load_files.map((f) => [f.certificate, f.key]), [['/etc/caddy/origin/origin-cert.pem', '/etc/caddy/origin/origin-key.pem']]);
+  assert.ok(!JSON.stringify(tls).includes('"issuers"'), 'an ACME or other issuer');
+  assert.equal(tls.disable_ocsp_stapling, true, 'OCSP stapling (a call out) is on');
+  assert.deepEqual(Object.keys(config.apps).sort(), ['http', 'tls'], 'another app (pki: a CA of its own)');
+  // No setting reaches the TLS rules: caddy gets DOMAIN only, the Caddyfile's only placeholder.
+  assert.deepEqual(Object.keys(base().services.caddy.environment ?? {}), ['DOMAIN'], "caddy's settings");
+  const code = readText(path.join(DEPLOY_DIR, 'Caddyfile')).split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+  assert.deepEqual([...new Set([...code.matchAll(/\{\$[^}]*\}|\{env\.[^}]*\}/g)].map((m) => m[0]))], ['{$DOMAIN}'], 'a setting reaches the Caddyfile');
 });
 
 test('request bodies: 9 MB only for multipart uploads, otherwise the largest body limit of the backends', () => {
@@ -846,11 +944,13 @@ test('F-17: backups go to the required BACKUP_DIR bind, never created implicitly
   assert.deepEqual({ type: ciBackup.type, source: ciBackup.source }, { type: 'volume', source: 'ci-backups' });
 });
 
-test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the env file without printing values', () => {
+test('F-17: the preflight refuses a BACKUP_DIR inside the clone, checks the edge\'s TLS files and the env file, without printing values', () => {
   const secrets = Object.entries(ciValues()).filter(([k, v]) => /PASSWORD|SECRET|_KEY$/.test(k) && v !== '').map(([, v]) => v);
-  // Runs inside the db image (bash, coreutils): the file modes a check needs exist only on a
-  // Linux file system. A stand-in `docker` records its arguments, so the last check's call is
-  // visible without a Docker daemon in the container.
+  // Runs inside the db image (bash, coreutils, openssl): the file modes a check needs exist only
+  // on a Linux file system. A stand-in `docker` records its arguments, so the last check's call is
+  // visible without a Docker daemon in the container. The TLS files are throw-away ones
+  // (deploy/test/throwaway-pki.sh, for DOMAIN=localhost as in deploy/ci.env), made in here as
+  // root: the key root's with mode 600, the certificate and the CA with mode 644.
   const driver = [
     'set -u',
     'mkdir -p /work /clone/backups',
@@ -864,7 +964,18 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     'install -d -m 700 /work/backups',
     'install -d -m 755 /work/open',
     'ln -s /clone/backups /work/into-clone',
-    'envfile() { sed "s|^BACKUP_DIR=.*|BACKUP_DIR=$1|" /clone/deploy/ci.env > /work/prod.env; chmod 600 /work/prod.env; }',
+    'sh /opt/throwaway-pki.sh /work/pki localhost > /dev/null',
+    'cp -a /work/pki/edge /work/tls',
+    // Certificates that fit only in part: expired long ago, another name, another key; a CA that
+    // expired long ago.
+    "openssl req -x509 -new -key /work/pki/edge/origin-key.pem -sha256 -subj /CN=localhost -addext 'subjectAltName=DNS:localhost' -not_before 20200101000000Z -not_after 20200102000000Z -out /work/cert-expired.pem 2>/dev/null",
+    "openssl req -x509 -new -key /work/pki/edge/origin-key.pem -sha256 -subj /CN=other.example.invalid -addext 'subjectAltName=DNS:other.example.invalid' -days 1 -out /work/cert-other-name.pem 2>/dev/null",
+    'openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /work/other.key 2>/dev/null',
+    "openssl req -x509 -new -key /work/other.key -sha256 -subj /CN=localhost -addext 'subjectAltName=DNS:localhost' -days 1 -out /work/cert-other-key.pem 2>/dev/null",
+    "openssl req -x509 -new -key /work/other.key -sha256 -subj '/CN=expired CA' -addext 'basicConstraints=critical,CA:TRUE' -not_before 20200101000000Z -not_after 20200102000000Z -out /work/ca-expired.pem 2>/dev/null",
+    'envfile() { sed -e "s|^BACKUP_DIR=.*|BACKUP_DIR=$1|" -e "s|^ORIGIN_TLS_DIR=.*|ORIGIN_TLS_DIR=${2:-/work/tls}|" /clone/deploy/ci.env > /work/prod.env; chmod 600 /work/prod.env; }',
+    // A fresh copy of the good TLS files for one case, at /work/case.
+    'tlscase() { rm -rf /work/case; cp -a /work/pki/edge /work/case; envfile /work/backups /work/case; }',
     "run() { out=$(bash /clone/deploy/scripts/preflight.sh \"${ENV_FILE:-/work/prod.env}\" 2>&1); code=$?; printf '=== %s exit %s\\n%s\\n' \"$1\" \"$code\" \"$out\"; }",
     'envfile /work/backups; run ok; echo "docker: $(cat /work/docker-args)"',
     'envfile relative/backups; run relative',
@@ -889,13 +1000,34 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     "envfile /work/backups; sed -i -e 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' -e 's/^MAIL_GRAPH_CLIENT_ID=.*/MAIL_GRAPH_CLIENT_ID=00000000-0000-4000-8000-00000000000b/' -e 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run graph-ok",
     "envfile /work/backups; sed -i 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run smtp-no-host",
     "envfile /work/backups; sed -i 's/^MAIL_FROM_ADDRESS=.*/MAIL_FROM_ADDRESS=not-an-address/' /work/prod.env; run sender-not-an-address",
+    // The TLS folder and its three files.
+    'envfile /work/backups relative/tls; run tls-relative',
+    'envfile /work/backups /work/no-such-folder; run tls-missing',
+    'cp -a /work/pki/edge /clone/tls; envfile /work/backups /clone/tls; run tls-inside-clone',
+    'tlscase; chmod 777 /work/case; run tls-open',
+    'tlscase; chown 1000 /work/case; run tls-not-root',
+    'tlscase; rm /work/case/origin-key.pem; run key-missing',
+    'tlscase; chmod 644 /work/case/origin-key.pem; run key-readable',
+    'tlscase; mv /work/case/origin-key.pem /work/key-elsewhere.pem; ln -s /work/key-elsewhere.pem /work/case/origin-key.pem; run key-link',
+    'tlscase; cat /work/pki/edge/origin-cert.pem > /work/case/origin-key.pem; run key-not-a-key',
+    'tlscase; rm /work/case/origin-cert.pem; run cert-missing',
+    "tlscase; echo 'not a certificate' > /work/case/origin-cert.pem; run cert-not-a-certificate",
+    'tlscase; cat /work/cert-expired.pem > /work/case/origin-cert.pem; run cert-expired',
+    'tlscase; cat /work/cert-other-name.pem > /work/case/origin-cert.pem; run cert-other-name',
+    'tlscase; cat /work/cert-other-key.pem > /work/case/origin-cert.pem; run cert-other-key',
+    'tlscase; chmod 666 /work/case/origin-cert.pem; run cert-open',
+    'tlscase; rm /work/case/origin-pull-ca.pem; run ca-missing',
+    "tlscase; echo 'not a certificate' > /work/case/origin-pull-ca.pem; run ca-not-a-certificate",
+    'tlscase; cat /work/ca-expired.pem > /work/case/origin-pull-ca.pem; run ca-expired',
+    'tlscase; chmod 666 /work/case/origin-pull-ca.pem; run ca-open',
+    'tlscase; chmod 400 /work/case/origin-key.pem; run key-400',
     'envfile /work/backups; DB_PASSWORD=shell-value-not-a-secret run shell-export',
     'envfile /work/backups; FAKE_DOCKER_STATUS=1 run compose-fails',
     'ENV_FILE=/work/none.env run no-env-file',
   ].join('\n');
   assert.ok(fs.existsSync(path.join(DEPLOY_DIR, 'scripts', 'preflight.sh')), 'no deploy/scripts/preflight.sh');
   const r = dockerRun(serviceImage('db'), {
-    mounts: [{ src: DEPLOY_DIR, dst: '/clone/deploy' }],
+    mounts: [{ src: DEPLOY_DIR, dst: '/clone/deploy' }, { src: THROWAWAY_PKI, dst: '/opt/throwaway-pki.sh' }],
     entrypoint: 'bash',
     args: ['-c', driver],
   });
@@ -930,10 +1062,33 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     'graph-ok': [0, null],
     'smtp-no-host': [1, 'FAIL  MAIL_HOST is set (MAIL_MAILER=smtp)'],
     'sender-not-an-address': [1, 'FAIL  MAIL_FROM_ADDRESS has a valid form: an e-mail address'],
+    'tls-relative': [1, 'FAIL  ORIGIN_TLS_DIR is an absolute path'],
+    'tls-missing': [1, 'FAIL  ORIGIN_TLS_DIR is an existing directory'],
+    'tls-inside-clone': [1, 'FAIL  ORIGIN_TLS_DIR lies outside this clone'],
+    'tls-open': [1, 'FAIL  ORIGIN_TLS_DIR belongs to root and only root can change it'],
+    'tls-not-root': [1, 'FAIL  ORIGIN_TLS_DIR belongs to root and only root can change it'],
+    'key-missing': [1, 'FAIL  ORIGIN_TLS_DIR/origin-key.pem is a file, not a symbolic link'],
+    'key-readable': [1, 'FAIL  origin-key.pem belongs to root with mode 600 or 400'],
+    // A link would point to a path that does not exist inside caddy's container.
+    'key-link': [1, 'FAIL  ORIGIN_TLS_DIR/origin-key.pem is a file, not a symbolic link'],
+    'key-not-a-key': [1, 'FAIL  origin-key.pem holds a private key'],
+    'key-400': [0, null],
+    'cert-missing': [1, 'FAIL  ORIGIN_TLS_DIR/origin-cert.pem is a file, not a symbolic link'],
+    'cert-not-a-certificate': [1, 'FAIL  origin-cert.pem holds a certificate'],
+    'cert-expired': [1, 'FAIL  origin-cert.pem has not expired (Cloudflare would answer 526)'],
+    'cert-other-name': [1, 'FAIL  origin-cert.pem names DOMAIN'],
+    'cert-other-key': [1, 'FAIL  origin-cert.pem belongs to origin-key.pem'],
+    'cert-open': [1, 'FAIL  origin-cert.pem belongs to root and only root can change it'],
+    'ca-missing': [1, 'FAIL  ORIGIN_TLS_DIR/origin-pull-ca.pem is a file, not a symbolic link'],
+    'ca-not-a-certificate': [1, 'FAIL  origin-pull-ca.pem holds a certificate'],
+    'ca-expired': [1, 'FAIL  origin-pull-ca.pem has not expired (every handshake with Cloudflare would fail: 525)'],
+    'ca-open': [1, 'FAIL  origin-pull-ca.pem belongs to root and only root can change it'],
     'shell-export': [1, "FAIL  set in this shell as well, docker compose would use the shell's value (unset them): DB_PASSWORD"],
     'compose-fails': [1, 'FAIL  docker compose renders the production compose'],
     'no-env-file': [1, 'FAIL  the env file exists'],
   };
+  // The TLS cases that break one thing fail one check: each check stands on its own.
+  const single = ['tls-inside-clone', 'tls-open', 'tls-not-root', 'key-readable', 'cert-not-a-certificate', 'cert-expired', 'cert-other-name', 'cert-other-key', 'cert-open', 'ca-not-a-certificate', 'ca-expired', 'ca-open'];
   assert.deepEqual(Object.keys(runs).sort(), Object.keys(expected).sort(), r.stdout);
   console.log(`preflight: ${Object.keys(expected).length} cases`);
   for (const [name, [code, line]] of Object.entries(expected)) {
@@ -941,9 +1096,13 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     assert.equal(runs[name].code, code, `${name}:\n${out}`);
     if (line) assert.ok(out.includes(line), `${name}: expected "${line}" in:\n${out}`);
     assert.match(out, /preflight: \d+ checks, \d+ failed/, `${name}: no total`);
+    if (single.includes(name)) assert.match(out, /preflight: \d+ checks, 1 failed/, `${name}: more than one check failed:\n${out}`);
     for (const value of [...secrets, 'shell-value-not-a-secret']) assert.ok(!out.includes(value), `${name} printed a value`);
+    assert.doesNotMatch(out, /-----BEGIN/, `${name} printed a key or a certificate`);
   }
-  assert.match(runs.ok.out, /preflight: 17 checks, 0 failed/);
+  // Every check passed with the good files: the key at mode 600, and at 400 (key-400); the
+  // certificate and the CA at mode 644, readable by everyone.
+  assert.match(runs.ok.out, /preflight: 33 checks, 0 failed/);
   assert.match(r.stdout, /^docker: compose --project-directory \/clone\/deploy --env-file \/work\/prod\.env -f \/clone\/deploy\/docker-compose\.yml config --quiet $/m);
 });
 
@@ -1216,13 +1375,14 @@ test('F-25: Dependabot watches the Dockerfiles and the compose files of deploy/'
 
 // ------------------------------------------------------------------------------ networks
 
-test('networks: only caddy publishes ports (IPv4), db and the jobs sit on internal networks, caddy reaches neither the scheduler nor db', () => {
+test('networks: only caddy publishes a port (443, IPv4), db and the jobs sit on internal networks, caddy reaches neither the scheduler nor db', () => {
   const config = base();
   const services = servicesOf(config);
   const published = services.filter(([, s]) => (s.ports ?? []).length > 0).map(([n]) => n);
   assert.deepEqual(published, ['caddy']);
   for (const p of config.services.caddy.ports) assert.equal(p.host_ip, '0.0.0.0', `port ${p.target} is published for IPv4 only`);
-  assert.deepEqual(config.services.caddy.ports.map((p) => `${p.published}:${p.target}`).sort(), ['443:443', '80:80']);
+  // 443 for Cloudflare, nothing on 80: no ACME and no redirect (deploy/Caddyfile).
+  assert.deepEqual(config.services.caddy.ports.map((p) => `${p.published}:${p.target}/${p.protocol ?? 'tcp'}`), ['443:443/tcp']);
 
   const nets = config.networks;
   for (const [name, n] of Object.entries(nets)) assert.equal(n.enable_ipv6, false, `${name}: IPv6`);

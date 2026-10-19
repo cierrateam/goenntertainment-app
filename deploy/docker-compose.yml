@@ -1,17 +1,18 @@
 # GÖ4Fun auf einem Server – alle Teile als Container.
 #
-#   Internet ─► caddy (HTTPS, Port 80/443)
-#                 ├─► media (public uploads as plain files, read-only; holds no secrets)
-#                 └─► api   (Laravel, api/)       die ganze API, die Uploads, das Schema
-#                 scheduler (dasselbe Abbild)     Laravels Zeitplan: Abos, Credits, Aufräumen
-#                 db  (MySQL)  ◄── api und scheduler; the nightly backup (backup)
+#   Cloudflare ─► caddy (HTTPS on port 443 only, through the platform's load balancer)
+#                   ├─► media (public uploads as plain files, read-only; holds no secrets)
+#                   └─► api   (Laravel, api/)       the whole API, the uploads, the schema
+#                   scheduler (the same image)      Laravel's schedule: subscriptions, credits, clean-up
+#                   db  (MySQL)  ◄── api and the scheduler; the nightly backup (backup)
 #
 # Das Node-Backend (server/) läuft seit dem Marktplatz-Umbau nicht mehr mit: Laravel beantwortet
 # alle Routen selbst und verwaltet auch das Schema (`php artisan migrate` beim Start des
 # api-Containers, api/docker/entrypoint.sh). Von außen erreichbar ist nur Caddy.
 #
 # Networks (who can reach whom; the bottom of this file has the details):
-#   edge      caddy <-> api. caddy's ports, certificates and api's mail go through here.
+#   edge      caddy <-> api. caddy's published port and api's mail go through here; caddy itself
+#             calls out to nothing.
 #   media     caddy <-> media. Internal: the file server has no way out and reaches nothing else.
 #   app       api and scheduler -> db. Internal: no way out.
 #   data      db <-> backup, admin-gate, seed. Internal.
@@ -308,11 +309,9 @@ services:
       admin-gate:
         condition: service_completed_successfully
     ports:
-      # IPv4 only. The networks have no IPv6, so Docker would relay an IPv6 client with the
-      # network's gateway as its address: every IPv6 client would share one address in the
-      # rate limits. Until IPv6 is set up end to end the domain gets no AAAA record
-      # (deploy/.env.example, DOMAIN).
-      - '0.0.0.0:80:80'
+      # 443 only, IPv4 only: Cloudflare reaches the server through the platform's load balancer,
+      # and nothing listens on port 80 (no ACME, no redirect). The networks have no IPv6; IPv6
+      # visitors reach Cloudflare, and their address arrives in CF-Connecting-IP (deploy/Caddyfile).
       - '0.0.0.0:443:443'
     environment:
       DOMAIN: ${DOMAIN:?DOMAIN is missing in deploy/.env (an operator decision; see deploy/.env.example)}
@@ -323,15 +322,24 @@ services:
       media: {}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # Hier liegen die Let's-Encrypt-Zertifikate. Ohne dieses Volume holt Caddy
-      # bei jedem Neustart neue und läuft irgendwann ins Rate-Limit.
+      # The origin certificate, its key and the origin-pull CA, from a folder on the host,
+      # read-only (deploy/README.md, Origin certificate and Authenticated Origin Pulls). The long
+      # syntax with create_host_path: false: a missing folder stops the start instead of becoming
+      # an empty one.
+      - type: bind
+        source: ${ORIGIN_TLS_DIR:?ORIGIN_TLS_DIR is missing in deploy/.env (the folder with the origin certificate files; see deploy/.env.example)}
+        target: /etc/caddy/origin
+        read_only: true
+        bind:
+          create_host_path: false
+      # Caddy's own state; no certificate lives here (the certificate is a file, there is no ACME).
       - caddy-data:/data
       - caddy-config:/config
       # No uploads volume: caddy follows symbolic links, so a link planted there would hand out
-      # the keys in caddy-data. The media service serves the uploads (deploy/Caddyfile.media).
+      # the origin key. The media service serves the uploads (deploy/Caddyfile.media).
     security_opt: ['no-new-privileges:true']
     cap_drop: [ALL]
-    # Runs as root in its image and binds 80 and 443.
+    # Runs as root in its image (it reads the root-owned key as its owner) and binds 443.
     cap_add: [NET_BIND_SERVICE]
     logging: *logging
 

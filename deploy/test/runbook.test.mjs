@@ -21,6 +21,7 @@ import {
 const SECTIONS = [
   'What runs',
   'Prerequisites',
+  'Cloudflare and the load balancer',
   'Settings',
   'First start',
   'The app build',
@@ -404,6 +405,7 @@ test('runbook: values it shares with the code agree', () => {
     ['Compose version for !reset', path.join(DEPLOY_DIR, 'docker-compose.ci.yml'), /!reset needs Compose >= (\d+\.\d+\.\d+)/, /Docker Compose v(\d+\.\d+\.\d+) or newer/g],
     ['multipart body limit', path.join(DEPLOY_DIR, 'Caddyfile'), /@multipart \{\s*max_size (\d+)MB/, /(\d+) MB for uploads/g],
     ['other body limit', path.join(DEPLOY_DIR, 'Caddyfile'), /@not_multipart \{\s*max_size (\d+)KiB/, /(\d+) KiB for everything else/g],
+    ['upload cache lifetime', path.join(DEPLOY_DIR, 'Caddyfile'), />Cache-Control "public, max-age=(\d+)"/, /`Cache-Control: public, max-age=(\d+)`/g],
   ];
   const problems = [];
   for (const [what, file, inCode, inRunbook] of mirrors) {
@@ -415,6 +417,31 @@ test('runbook: values it shares with the code agree', () => {
     for (const v of said) if (code !== undefined && v !== code) problems.push(`${what}: deploy/README.md says ${v}, ${where} says ${code}`);
   }
   console.log(`shared values: ${mirrors.length}`);
+  assert.deepEqual(problems, []);
+});
+
+test("runbook: the edge's TLS files and the uploads' cache lifetime are the ones the Caddyfile and the preflight use", () => {
+  const caddyfile = readText(path.join(DEPLOY_DIR, 'Caddyfile')).replace(/\r\n/g, '\n');
+  const files = [...new Set([...caddyfile.matchAll(/\/etc\/caddy\/origin\/([\w.-]+)/g)].map((m) => m[1]))].sort();
+  console.log(`TLS files in deploy/Caddyfile: ${files.join(', ') || 'none'}`);
+  assert.ok(files.length > 0, 'no TLS file in deploy/Caddyfile: refusing to report clean');
+  const text = runbook();
+  const preflight = readText(path.join(DEPLOY_DIR, 'scripts', 'preflight.sh'));
+  const origin = sections(text, 3).get('Origin certificate and Authenticated Origin Pulls') ?? '';
+  assert.ok(origin, 'deploy/README.md has no "### Origin certificate and Authenticated Origin Pulls"');
+  const problems = [];
+  for (const f of files) {
+    if (!origin.includes(`\`<ORIGIN_TLS_DIR>/${f}\``)) problems.push(`${f}: not in the runbook's table of the TLS files`);
+    if (!preflight.includes(`/${f}`)) problems.push(`${f}: not checked by deploy/scripts/preflight.sh`);
+  }
+  // The compose mounts the folder where the Caddyfile reads it.
+  if (!/target: \/etc\/caddy\/origin\r?$/m.test(composeText())) problems.push('the compose does not mount ORIGIN_TLS_DIR at /etc/caddy/origin');
+  // The runbook says how long Cloudflare may keep an upload, in minutes.
+  const seconds = Number(/>Cache-Control "public, max-age=(\d+)"/.exec(caddyfile)?.[1]);
+  const words = { 1: 'one', 2: 'two', 5: 'five', 10: 'ten', 15: 'fifteen', 30: 'thirty', 60: 'sixty' };
+  const minutes = words[seconds / 60];
+  if (!minutes) problems.push(`the upload cache lifetime (${seconds} s) is not a number of minutes the runbook can say`);
+  else if (!new RegExp(`within ${minutes} minutes`).test(text.replace(/\s+/g, ' '))) problems.push(`the runbook does not say "within ${minutes} minutes"`);
   assert.deepEqual(problems, []);
 });
 
