@@ -38,7 +38,7 @@ Cloudflare ─► load balancer ─► caddy :443   TLS for Cloudflare only, sec
 | `api` | built from `api/Dockerfile` | Laravel on port 8080 as the user `www-data` (uid 33); runs the migrations before Apache starts; answers every route; stores the uploads, checked and re-encoded, in two volumes outside its docroot; sends mail through Microsoft Graph or over SMTP (`MAIL_MAILER`) | edge, app | `uploads`, `private-media` | long-running |
 | `scheduler` | built from `api/Dockerfile` | `php artisan schedule:work` (`api/routes/console.php`): club renewals every hour, credit expiry every five minutes, the credit reminder mails every day, the retention prune every hour; no Apache | app, outbound | `private-media` | long-running; starts once `api` is healthy |
 | `db` | `mysql:8.4` (pinned) | the database `goenntertainment`; on the very first start (empty volume) it creates the daily rotation of its binary log (`deploy/mysql/02-binlog-rotate.sql`); the tables come from api's migrations | app, data | `db-data` | long-running |
-| `backup` | `mysql:8.4` (pinned) | a database dump and an uploads archive every night at 02:30 UTC and once at start, then pruning (`deploy/scripts/backup.sh`) | data | `uploads` and `private-media` (read-only; the evidence images, mode 640, through the `www-data` group), `<BACKUP_DIR>` (host folder) | long-running |
+| `backup` | `mysql:8.4` (pinned) | a database dump and an uploads archive every night at 02:30 UTC and once at start; the nightly runs then delete old sets, the run at start deletes nothing (`deploy/scripts/backup.sh`) | data | `uploads` and `private-media` (read-only; the evidence images, mode 640, through the `www-data` group), `<BACKUP_DIR>` (host folder) | long-running |
 | `storage-init` | `busybox:1.37` (pinned) | creates the upload folders and gives them to uid 33 (`www-data`) | none | `uploads`, `private-media` | one-shot on every `up` |
 | `admin-gate` | `mysql:8.4` (pinned) | refuses to let `caddy` start while no admin account exists (`deploy/scripts/admin-gate.sh`) | data | none | one-shot on every `up` |
 | `seed` | built from `api/Dockerfile` | creates the first admin account (`php artisan admin:create`); never started by `docker compose up` (profile `tools`) | data | none | one-off, `docker compose run --rm seed` |
@@ -621,12 +621,13 @@ whenever the service starts:
   while the uploads are archived: when files were added or removed meanwhile, the log says so and
   the set is kept (the archive holds the files as they were found); any other archive error fails
   the run.
-- **Retention**: after each successful run, the sets older than `BACKUP_RETENTION_DAYS` days are
-  deleted, but never the newest `BACKUP_RETENTION_DAYS` sets (by the stamp in their names),
-  whatever their age; a set's three files go or stay together. With one set a night that is the
-  same as deleting by age. After a restore of an old restore point, the run at start keeps the
-  newest of the sets the restore point holds, the one written on its night included. A failed run
-  deletes nothing.
+- **Retention**: after each successful nightly run, and after a run by hand (`--once`), the sets
+  older than `BACKUP_RETENTION_DAYS` days are deleted, but never the newest
+  `BACKUP_RETENTION_DAYS` sets (by the stamp in their names), whatever their age; a set's three
+  files go or stay together. With one set a night that is the same as deleting by age. The run at
+  start deletes nothing, however often the service starts: after a restore of an old restore
+  point, the sets it holds stay until the next nightly run, and that run keeps the newest
+  `BACKUP_RETENTION_DAYS` sets. A failed run deletes nothing.
 - **Time**: 02:30 UTC is a technical constant (`RUN_AT_UTC` in `deploy/scripts/backup.sh`). The
   set written then is the consistent copy of the database inside every restore point of the
   platform; the database files a restore point holds are crash-consistent at best. Another time
@@ -653,7 +654,7 @@ Checking:
 docker compose ps backup                    # healthy: the last run succeeded within 26 hours, none failed since
 docker compose logs backup --tail 20
 ls -l <BACKUP_DIR>
-docker compose exec backup bash /opt/deploy/backup.sh --once     # one run now
+docker compose exec backup bash /opt/deploy/backup.sh --once     # one run now; it deletes old sets like a nightly run
 docker compose exec backup bash /opt/deploy/backup.sh --check    # the healthcheck by hand
 ```
 
@@ -725,9 +726,12 @@ of its own, not into the new `<BACKUP_DIR>`: the backup service deletes old sets
 
 The platform restores the whole server from a restore point. It comes back with every service
 running, caddy and backup included: the app serves the database as the restore point caught it,
-and the backup service makes its run at start.
+and the backup service makes its run at start, which deletes nothing.
 
-1. At once, stop the services that write (step 2 of [Restore](#restore)):
+1. At once, and in any case before the next nightly run at 02:30 UTC, stop the services that
+   write (step 2 of [Restore](#restore)). That run deletes old sets as every night: with a small
+   `BACKUP_RETENTION_DAYS` it keeps only that many sets, and the one of the restore point's night
+   may not be among them:
 
    ```bash
    docker compose stop caddy api scheduler backup

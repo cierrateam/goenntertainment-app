@@ -3,9 +3,12 @@
 # deploy/docker-compose.yml, in the MySQL image (it has bash, mysqldump, gzip, tar, sha256sum and
 # GNU find and date; it has no flock, so the lock is a directory).
 #
-#   backup.sh                       daemon: one run at start, then one every day at 02:30 UTC
+#   backup.sh                       daemon: one run at start (--at-start), then one every day at
+#                                   02:30 UTC (--once)
 #   backup.sh --once                one run now; exit 0 = a complete, verified set was written
-#                                   (each run first waits up to about 5 minutes for the database)
+#                                   (each run first waits up to about 5 minutes for the database);
+#                                   then it deletes old sets
+#   backup.sh --at-start            the daemon's run at start: as --once, but it deletes nothing
 #   backup.sh --check               healthcheck: exit 0 when the last run succeeded within 26 hours
 #                                   and no run failed since
 #   backup.sh --seconds-until-next  the seconds until the next nightly run (BACKUP_NOW, a time in
@@ -16,13 +19,15 @@
 #   uploads-<stamp>.tar.gz    the public uploads and the private media (evidence, stories)
 #   SHA256SUMS-<stamp>        the checksums of both
 # The set is put together in .partial-<stamp>, checked (gzip -t, the dump's completion line,
-# tar -t, the checksums) and only then moved into /backups. Only after that are old sets deleted:
-# a set's three files go or stay together; the newest BACKUP_RETENTION_DAYS sets (by the stamp in
-# their names) stay whatever their age; of the older sets, those older than BACKUP_RETENTION_DAYS
-# days go. With one set a night that is the same as deleting by age; on a server restored from an
-# old copy of its disk, the run at start keeps the sets that copy holds. A failed run deletes
-# nothing, records .last-failure and exits non-zero; the healthcheck then reports the service as
-# unhealthy.
+# tar -t, the checksums) and only then moved into /backups. Only after that, in a nightly run and in
+# a run by hand, are old sets deleted: a set's three files go or stay together; the newest
+# BACKUP_RETENTION_DAYS sets (by the stamp in their names) stay whatever their age; of the older
+# sets, those older than BACKUP_RETENTION_DAYS days go. With one set a night that is the same as
+# deleting by age. The run at start deletes nothing, however often the service starts: a server
+# restored from an old copy of its disk boots with every service running, and the sets that copy
+# holds must stay until someone has picked one; the next nightly run keeps the newest
+# BACKUP_RETENTION_DAYS sets. A failed run deletes nothing, records .last-failure and exits
+# non-zero; the healthcheck then reports the service as unhealthy.
 #
 # Secrets: the database password reaches mysqldump through an option file in /tmp (a tmpfs),
 # written by the shell's builtin printf, so it is on no command line and in no log.
@@ -53,6 +58,8 @@ readonly DB_WAIT_TRIES=60
 readonly DB_WAIT_STEP_SECONDS=5
 
 RETENTION_DAYS=''
+# 1: the run deletes old sets after its own (--once); 0: it deletes nothing (--at-start).
+PRUNE_AFTER=1
 LOCK_HELD=0
 PARTIAL=''
 STAMP=''
@@ -292,11 +299,17 @@ run_once() {
   date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_ROOT/.last-success"
   log "run $STAMP written: database dump $(stat -c %s "$BACKUP_ROOT/$dump") bytes, uploads archive with $files file(s), checksums verified"
 
-  # Only after a complete, verified set.
-  prune
+  # Only after a complete, verified set, and never in the run at start.
+  if [[ "$PRUNE_AFTER" == 1 ]]; then
+    prune
+  else
+    log 'the run at start deletes nothing; the next nightly run deletes old sets'
+  fi
 }
 
+# once 1: a run that deletes old sets after its own (--once); once 0: one that deletes nothing.
 once() {
+  PRUNE_AFTER=$1
   validate_settings
   trap 'finish $?' EXIT
   trap 'exit 143' TERM INT
@@ -317,12 +330,15 @@ daemon() {
     rmdir "$BACKUP_ROOT/.lock" && log 'removed the lock of an interrupted run'
   fi
   find "$BACKUP_ROOT" -maxdepth 1 -type d -name '.partial-*' -exec rm -rf -- {} +
-  log "nightly at $RUN_AT_UTC UTC; sets are kept for $RETENTION_DAYS day(s), the newest $RETENTION_DAYS whatever their age; first run now"
+  log "nightly at $RUN_AT_UTC UTC; sets are kept for $RETENTION_DAYS day(s), the newest $RETENTION_DAYS whatever their age; first run now, which deletes nothing"
+  # The run at start deletes nothing; the nightly runs after it do.
+  local mode=--at-start
   while true; do
-    bash "$0" --once &
+    bash "$0" "$mode" &
     child=$!
     wait "$child" || log 'the run failed; the next one is scheduled as usual'
     child=''
+    mode=--once
     wait_seconds=$(seconds_until_next)
     log "next run in ${wait_seconds}s"
     sleep "$wait_seconds" &
@@ -332,11 +348,12 @@ daemon() {
 
 case "${1:-}" in
   '') daemon ;;
-  --once) once ;;
+  --once) once 1 ;;
+  --at-start) once 0 ;;
   --check) check ;;
   --seconds-until-next) seconds_until_next ;;
   *)
-    fail "unknown argument: $1 (allowed: --once, --check, --seconds-until-next)"
+    fail "unknown argument: $1 (allowed: --once, --at-start, --check, --seconds-until-next)"
     exit 2
     ;;
 esac

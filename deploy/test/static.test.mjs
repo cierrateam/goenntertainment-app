@@ -1148,6 +1148,19 @@ for i in $(seq 1 64); do head -c 16384 /dev/urandom > /data/uploads/posts/file-$
 head -c 100 /dev/urandom > /data/private-media/evidence/kept.png
 cat > /usr/local/bin/sleep <<'EOF'
 #!/bin/sh
+# Under as_daemon, the daemon's wait for the next night: the first one lets the night pass (every
+# file in /backups two days older, and a real second, so the next stamp differs), the second one
+# stops the daemon.
+if [ -e /work/daemon ]; then
+  n=$(( $(cat /work/daemon) + 1 )); echo "$n" > /work/daemon
+  if [ "$n" -eq 1 ]; then
+    for f in /backups/*; do [ -f "$f" ] && touch -d "@$(( $(stat -c %Y "$f") - 172800 ))" "$f"; done
+    /usr/bin/sleep 1.1
+  else
+    kill -TERM "$PPID"
+  fi
+  exit 0
+fi
 echo "$1" >> /work/sleeps
 echo $(( $(cat /work/clock) + $1 )) > /work/clock
 EOF
@@ -1181,11 +1194,13 @@ once() {
   rm -rf /backups/* /backups/.[!.]*
   run "$1"
 }
-# run <name>: one run on the sets already in /backups (plant puts them there), and what happened.
+# run <name> [<argument>]: one run (--once unless the argument says otherwise) on the sets
+# already in /backups (plant puts them there), and what happened.
 run() {
   rm -f /work/sleeps /work/pings /work/dumps /data/uploads/added-while-archiving
   echo 0 > /work/clock
-  out=$(bash /opt/deploy/backup.sh --once 2>&1); code=$?
+  mode=--once; [ "$#" -ge 2 ] && mode=$2
+  out=$(bash /opt/deploy/backup.sh "$mode" 2>&1); code=$?
   printf '=== %s exit %s\n%s\n' "$1" "$code" "$out"
   echo "check: $(bash /opt/deploy/backup.sh --check 2>&1)"
   echo "sleeps: $(cat /work/sleeps 2>/dev/null | wc -l) of $(sort -u /work/sleeps 2>/dev/null | tr '\n' ' ')s"
@@ -1195,8 +1210,20 @@ run() {
   latest=$(ls /backups | grep '^uploads-' | tail -n 1)
   echo "sets: $(ls /backups | grep -c '^uploads-')"
   echo "archived files: $(if [ -n "$latest" ]; then /usr/bin/tar -tzf "/backups/$latest" | grep -c -v '/$'; else echo none; fi)"
-  # Every stamp left, oldest first, with how many of its three files are there.
+  leftover
+}
+# Every stamp left, oldest first, with how many of its three files are there.
+leftover() {
   echo "left: $(ls /backups | sed -n -E 's/^(db-|uploads-|SHA256SUMS-)([0-9]{8}T[0-9]{6}Z).*$/\2/p' | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')"
+}
+# as_daemon <name>: the service itself (backup.sh without an argument), through its run at start
+# and one nightly run; the stand-in sleep lets the night pass in between and then stops it.
+as_daemon() {
+  rm -f /work/sleeps /work/pings /work/dumps; echo 0 > /work/clock; echo 0 > /work/daemon
+  out=$(timeout 120 bash /opt/deploy/backup.sh 2>&1); code=$?
+  rm -f /work/daemon
+  printf '=== %s exit %s\n%s\n' "$1" "$code" "$out"
+  leftover
 }
 # plant <age in minutes> [<age of its SHA256SUMS file>]: a set as a run that long ago left it, its
 # stamp from that time, on an empty or planted /backups (fresh empties it). Prints the stamp.
@@ -1331,6 +1358,61 @@ test("F-17: prune keeps the newest BACKUP_RETENTION_DAYS sets whatever their age
   assert.notEqual(failed.code, 0, 'failed: the run passed');
   assert.deepEqual(Object.keys(left(failed)).sort(), [...planted(failed)].sort(), 'failed: a set was deleted');
   assert.ok(failed.out.includes('nothing was deleted'), `failed:\n${failed.out}`);
+});
+
+test('F-17: the run at start deletes nothing, however often the service starts; with BACKUP_RETENTION_DAYS=1 a nightly run and one by hand keep exactly the newest set', () => {
+  // A server restored from a restore point older than the retention: five sets, all older than a
+  // day, before each case.
+  const DAY = 1440;
+  const planting = `fresh; p=''; ${[14, 13, 12, 11, 10].map((d) => `p="$p $(plant ${d * DAY})"`).join('; ')}`;
+  const runs = backupCases([
+    'export BACKUP_RETENTION_DAYS=1',
+    `${planting}; run start --at-start; echo "planted:$p"`,
+    // A second start, a second later (a stamp of its own): a Docker restart, a `docker compose up -d`.
+    `${planting}; run first-start --at-start; /usr/bin/sleep 1.1; run two-starts --at-start; echo "planted:$p"`,
+    `${planting}; run by-hand --once; echo "planted:$p"`,
+    // The service itself: its run at start, the night, its nightly run.
+    `${planting}; as_daemon nightly; echo "planted:$p"`,
+  ]);
+  assert.deepEqual(Object.keys(runs), ['start', 'first-start', 'two-starts', 'by-hand', 'nightly']);
+  const planted = (r) => String(r.planted ?? '').trim().split(/\s+/).filter(Boolean);
+  const left = (r) => Object.fromEntries(String(r.left ?? '').trim().split(/\s+/).filter(Boolean).map((e) => e.split(':')).map(([s, n]) => [s, Number(n)]));
+  const sets = (r) => Object.keys(left(r)).sort();
+  console.log(`retention 1: ${Object.entries(runs).map(([n, r]) => `${n}: exit ${r.code}, ${sets(r).length} set(s) left`).join('; ')}`);
+  for (const [name, r] of Object.entries(runs)) {
+    assert.equal(r.code, 0, `${name}:\n${r.out}`);
+    assert.deepEqual(Object.entries(left(r)).filter(([, n]) => n !== 3).map(([s, n]) => `${s}: ${n} of 3 files`), [], `${name}: a set was split`);
+  }
+  const { start, 'two-starts': twoStarts, 'by-hand': byHand, nightly } = runs;
+  const fiveOld = planted(start);
+  assert.equal(fiveOld.length, 5, 'start: planting failed');
+
+  // The run at start: its own set next to all the old ones, nothing deleted.
+  assert.equal(sets(start).length, 6, `start: ${start.left}`);
+  assert.deepEqual(fiveOld.filter((s) => !sets(start).includes(s)), [], 'start: the run at start deleted an old set');
+  assert.match(start.out, /^backup: the run at start deletes nothing; the next nightly run deletes old sets$/m);
+  assert.doesNotMatch(start.out, /pruned|deleted /, 'start: the run at start pruned');
+
+  // Two starts in a row: two sets of their own, still nothing deleted.
+  assert.equal(sets(twoStarts).length, 7, `two-starts: ${twoStarts.left}`);
+  assert.deepEqual(planted(twoStarts).filter((s) => !sets(twoStarts).includes(s)), [], 'two-starts: a start deleted an old set');
+  assert.doesNotMatch(runs['first-start'].out + twoStarts.out, /pruned|deleted /, 'two-starts: a run at start pruned');
+
+  // A run by hand prunes: the newest set is its own, and it is the only one left.
+  assert.equal(sets(byHand).length, 1, `by-hand: ${byHand.left}`);
+  assert.ok(!planted(byHand).includes(sets(byHand)[0]), 'by-hand: an old set is left instead of the run\'s own');
+  assert.match(byHand.out, /^backup: pruned 15 file\(s\)/m);
+
+  // The service: its run at start deletes nothing; the night passes (every set two days older);
+  // the nightly run then keeps exactly the newest set, its own.
+  assert.match(nightly.out, /^backup: nightly at \d\d:\d\d UTC; .*first run now, which deletes nothing$/m);
+  assert.equal((nightly.out.match(/^backup: run \S+ written: /gm) ?? []).length, 2, `nightly: not a run at start and a nightly run:\n${nightly.out}`);
+  assert.match(nightly.out, /^backup: the run at start deletes nothing; the next nightly run deletes old sets$/m);
+  // The five old sets and the one of the run at start.
+  assert.match(nightly.out, /^backup: pruned 18 file\(s\)/m);
+  assert.equal(sets(nightly).length, 1, `nightly: ${nightly.left}`);
+  assert.ok(!planted(nightly).includes(sets(nightly)[0]), 'nightly: an old set is left instead of the nightly run\'s own');
+  assert.match(nightly.out, /^backup: stopping$/m);
 });
 
 test('settings checked in two places use the same patterns (preflight and the services)', () => {
