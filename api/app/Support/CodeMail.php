@@ -18,6 +18,8 @@ use Symfony\Component\Mailer\Transport\TransportInterface;
  * before each code mail: the log transport itself, or a failover or round-robin chain that
  * contains it (Symfony names a chain "failover(smtp://… log)"), and the mail is refused with an
  * exception. The callers treat that like any other failed mail; nothing with the code is logged.
+ * The `graph` transport (App\Mail\GraphTransport, named "graph") goes through like SMTP; a chain
+ * that holds it next to the log transport is refused all the same.
  * A faked mailer in tests (Mail::fake) is not a MailManager and is not checked.
  */
 final class CodeMail

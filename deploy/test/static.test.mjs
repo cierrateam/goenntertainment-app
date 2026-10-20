@@ -13,10 +13,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import {
-  CI_ENV, CI_OVERRIDE, COMPOSE_FILE, DEPLOY_DIR, ENV_EXAMPLE, REPO_ROOT, RUNBOOK,
+  CI_ENV, CI_OVERRIDE, COMPOSE_FILE, DEPLOY_DIR, ENV_EXAMPLE, REPO_ROOT, RUNBOOK, THROWAWAY_PKI,
   caddyAdapt, caddyHandlers, composeAsync, dockerRun, envFileValues, inCidr, interpolations,
   ipToInt, minimalEnv, mounts, parseEnvFile, readText, removeTemp, renderConfig, requiredSettings,
-  serviceImage, variantEnvFile,
+  serviceImage, throwawayPki, variantEnvFile,
 } from './lib.mjs';
 
 const composeText = () => readText(path.join(DEPLOY_DIR, COMPOSE_FILE));
@@ -50,6 +50,7 @@ const posix = (p) => String(p).replaceAll('\\', '/');
  */
 const REQUIRED = {
   DOMAIN: 'decision',
+  ORIGIN_TLS_DIR: 'technical',
   DB_PASSWORD: 'secret',
   DB_ROOT_PASSWORD: 'secret',
   APP_KEY: 'secret',
@@ -57,6 +58,8 @@ const REQUIRED = {
   PAYMENTS_MODE: 'decision',
   EVIDENCE_RETENTION_DAYS: 'decision',
   TOKEN_RETENTION_DAYS: 'decision',
+  MAIL_MAILER: 'decision',
+  MAIL_GRAPH_CLIENT_ID: 'technical',
   MAIL_HOST: 'decision',
   MAIL_USERNAME: 'decision',
   MAIL_PASSWORD: 'decision',
@@ -68,8 +71,12 @@ const REQUIRED = {
   MYSQL_BINLOG_RETENTION_DAYS: 'decision',
 };
 const REQUIRED_NAMES = Object.keys(REQUIRED).sort();
-/** Required to be present, but empty is allowed (`${NAME?}`): a mail relay without a login. */
-const MAY_BE_EMPTY = ['MAIL_PASSWORD', 'MAIL_USERNAME'];
+/**
+ * Required to be present, but empty is allowed (`${NAME?}`): a mail relay without a login, and the
+ * settings of the mail way that is not chosen (MAIL_HOST with graph, MAIL_GRAPH_CLIENT_ID with
+ * smtp; api/docker/entrypoint.sh and the preflight require the ones the chosen way needs).
+ */
+const MAY_BE_EMPTY = ['MAIL_PASSWORD', 'MAIL_USERNAME', 'MAIL_HOST', 'MAIL_GRAPH_CLIENT_ID'];
 
 const AUTH_LIMITS = [
   'REGISTER_IP', 'REGISTER_ACCOUNT', 'LOGIN_ACCOUNT_IP', 'LOGIN_IP', 'LOGIN_ACCOUNT', 'FORGOT_IP',
@@ -216,8 +223,13 @@ test('required settings: only allow-listed settings have defaults', () => {
     const expected = ALLOWED_DEFAULTS[name].value;
     if (expected !== undefined) assert.equal([...values][0], expected, `${name}'s default`);
   }
-  // The log mailer would write every code into the container log: SMTP in every service that mails.
-  for (const name of ['api', 'scheduler']) assert.equal(base().services[name].environment.MAIL_MAILER, 'smtp', name);
+  // How mail goes out is an operator decision without a default (graph or smtp; the entrypoint
+  // refuses everything else, the log mailer above all, which would write every code into the
+  // container log): required in every service that mails, the same in each.
+  for (const name of ['api', 'scheduler']) {
+    assert.match(serviceText(name), /^ {6}MAIL_MAILER: \$\{MAIL_MAILER:\?[^}\n]+\}$/m, `${name}: MAIL_MAILER is required, without a default`);
+    assert.equal(base().services[name].environment.MAIL_MAILER, ciValues().MAIL_MAILER, name);
+  }
 });
 
 test('required settings: PAYMENTS_MODE is required, the same in api and the scheduler, and its modes are the code\'s', () => {
@@ -232,6 +244,57 @@ test('required settings: PAYMENTS_MODE is required, the same in api and the sche
   assert.equal(config.services.seed.environment.PAYMENTS_MODE, undefined, 'the seed creates an account only');
   const preflight = readText(path.join(DEPLOY_DIR, 'scripts', 'preflight.sh'));
   assert.equal(/PAYMENTS_PATTERN='([^']+)'/.exec(preflight)?.[1], '^(off|test)$', 'the preflight accepts exactly off and test');
+});
+
+// The mailers Laravel ships besides smtp: each one stops the api image's start and fails the
+// preflight. log would write every code into the container log, array would drop the mail.
+const OTHER_MAILERS = ['log', 'array', 'failover', 'roundrobin', 'sendmail', 'ses', 'postmark', 'resend'];
+
+test("mail: the api image's entrypoint stops the start without graph or smtp, or without a setting the chosen way needs", () => {
+  // api/docker/entrypoint.sh (api and the scheduler) in the pinned busybox image, with a stand-in
+  // php: a start that passes the checks ends in `echo started`. Fake values only.
+  const client = '00000000-0000-4000-8000-00000000000b';
+  const common = 'APP_KEY=base64:ci-only-not-a-secret TRUSTED_PROXIES=172.30.99.10 MAIL_FROM_ADDRESS=ci-only@example.invalid';
+  const cases = {
+    graph: [`MAIL_MAILER=graph MAIL_GRAPH_CLIENT_ID=${client}`, null],
+    smtp: ['MAIL_MAILER=smtp MAIL_HOST=mailpit', null],
+    'graph-without-client': ['MAIL_MAILER=graph MAIL_HOST=mailpit', 'MAIL_GRAPH_CLIENT_ID'],
+    'smtp-without-host': [`MAIL_MAILER=smtp MAIL_GRAPH_CLIENT_ID=${client}`, 'MAIL_HOST'],
+    'no-mailer': ['MAIL_HOST=mailpit', 'MAIL_MAILER'],
+    ...Object.fromEntries(OTHER_MAILERS.map((mailer) => [mailer, [`MAIL_MAILER=${mailer} MAIL_HOST=mailpit`, 'MAIL_MAILER']])),
+    'no-sender': ['MAIL_MAILER=smtp MAIL_HOST=mailpit MAIL_FROM_ADDRESS=', 'MAIL_FROM_ADDRESS'],
+  };
+  const driver = [
+    'mkdir -p /var/www/api /usr/local/bin',
+    "printf '#!/bin/sh\\nexit 0\\n' > /usr/local/bin/php && chmod 755 /usr/local/bin/php",
+    ...Object.entries(cases).map(([name, [vars]]) => `out=$(env -i PATH=/usr/local/bin:/usr/bin:/bin ${common} ${vars} sh /opt/goenn-entrypoint.sh echo started 2>&1); printf '=== %s exit %s\\n%s\\n' '${name}' "$?" "$out"`),
+  ].join('\n');
+  const r = dockerRun(serviceImage('storage-init'), {
+    mounts: [{ src: path.join(REPO_ROOT, 'api', 'docker', 'entrypoint.sh'), dst: '/opt/goenn-entrypoint.sh' }],
+    entrypoint: 'sh',
+    args: ['-c', driver],
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const runs = Object.fromEntries(r.stdout.split(/^=== /m).slice(1).map((chunk) => {
+    const [head, ...rest] = chunk.split('\n');
+    const [, name, code] = /^(\S+) exit (\d+)$/.exec(head);
+    return [name, { code: Number(code), out: rest.join('\n') }];
+  }));
+  assert.deepEqual(Object.keys(runs).sort(), Object.keys(cases).sort(), r.stdout);
+  console.log(`mail entrypoint: ${Object.keys(cases).length} cases`);
+  for (const [name, [, missing]] of Object.entries(cases)) {
+    const { code, out } = runs[name];
+    if (missing === null) {
+      assert.equal(code, 0, `${name}:\n${out}`);
+      assert.match(out, /^started$/m, `${name} did not start`);
+    } else {
+      assert.equal(code, 1, `${name}: the start went on:\n${out}`);
+      assert.match(out, new RegExp(`ERROR: required settings missing or invalid:.*\\b${missing}\\(`), `${name}: ${missing} is not named:\n${out}`);
+      assert.doesNotMatch(out, /^started$/m, `${name} started anyway`);
+    }
+    // Names only, never values.
+    for (const value of [client, 'mailpit', 'ci-only@example.invalid']) assert.ok(!out.includes(value), `${name} printed a value`);
+  }
 });
 
 test('settings are documented in .env.example (blank, with who decides), deploy/ci.env and the runbook', () => {
@@ -275,7 +338,7 @@ test('ci-only env file is labelled and holds only fake values', () => {
     /^(10|172\.(1[6-9]|2\d|3[01])|192\.168)(\.\d{1,3}){1,2}$/,
   ];
   // A mode of the code rather than a value, one per setting: the one that moves no real money.
-  const ciModes = { PAYMENTS_MODE: 'test' };
+  const ciModes = { PAYMENTS_MODE: 'test', MAIL_MAILER: 'smtp' };
   const problems = [];
   for (const { name, value, line } of settings) {
     if (name.startsWith('ADMIN_')) problems.push(`${line}: ${name} (admin values never live in an env file)`);
@@ -434,9 +497,10 @@ test('F-29: uploads are mounted read-only into media, read-write into api outsid
   assert.match(conf, new RegExp(`<Directory ${parent.replaceAll('/', '\\/')}>\\s*AllowOverride None\\s*Options None\\s*Require all denied\\s*php_admin_flag engine off\\s*</Directory>`), `api/docker/apache.conf does not refuse ${parent}`);
 });
 
-test('F-29: caddy, which holds the certificate and account keys, mounts no volume another service mounts', () => {
+test('F-29: caddy, which holds the origin key, mounts no volume another service mounts', () => {
   // Caddy follows symbolic links: a link planted in a volume someone else writes would let caddy
-  // serve its own files (caddy-data) under an allowed name. So it shares no volume at all.
+  // serve its own files (the origin key in /etc/caddy/origin) under an allowed name. So it shares
+  // no volume at all.
   const all = mounts(base());
   const own = all.filter((m) => m.service === 'caddy' && m.type === 'volume');
   console.log(`caddy: ${own.length} volumes (${own.map((m) => m.source).join(', ')}), ${all.length} mounts of the compose checked`);
@@ -444,8 +508,35 @@ test('F-29: caddy, which holds the certificate and account keys, mounts no volum
   assert.deepEqual(own.map((m) => m.source).sort(), ['caddy-config', 'caddy-data']);
   const shared = all.filter((m) => m.service !== 'caddy' && own.some((o) => o.source === m.source));
   assert.deepEqual(shared.map((m) => `${m.service}: ${m.source}`), [], 'a volume of caddy is mounted elsewhere');
-  const binds = all.filter((m) => m.service === 'caddy' && m.type === 'bind').map((m) => `${posix(m.source).split('/').pop()} -> ${m.target}:${m.read_only ? 'ro' : 'rw'}`);
-  assert.deepEqual(binds, ['Caddyfile -> /etc/caddy/Caddyfile:ro']);
+  const binds = all.filter((m) => m.service === 'caddy' && m.type === 'bind').map((m) => `${m.target}:${m.read_only ? 'ro' : 'rw'}`);
+  assert.deepEqual(binds.sort(), ['/etc/caddy/Caddyfile:ro', '/etc/caddy/origin:ro'], "caddy's binds: the Caddyfile and the TLS folder, both read-only");
+});
+
+test('edge: the origin certificate files come from the required ORIGIN_TLS_DIR bind, read-only, never created implicitly, into caddy only', () => {
+  const all = mounts(base());
+  const origin = all.filter((m) => m.target === '/etc/caddy/origin');
+  assert.deepEqual(origin.map((m) => `${m.service}:${m.type}:${m.read_only ? 'ro' : 'rw'}`), ['caddy:bind:ro']);
+  assert.equal(posix(origin[0].source).replace(/^[A-Za-z]:/, ''), ciValues().ORIGIN_TLS_DIR, 'the bind source is ORIGIN_TLS_DIR');
+  // Rendered, create_host_path depends on the docker compose version (see the BACKUP_DIR bind);
+  // the compose file itself must say it, in the long syntax.
+  assert.ok([undefined, false].includes(origin[0].bind?.create_host_path), `the ORIGIN_TLS_DIR bind renders create_host_path: ${JSON.stringify(origin[0].bind?.create_host_path)}`);
+  assert.match(
+    serviceText('caddy'),
+    /^ *- type: bind\n *source: \$\{ORIGIN_TLS_DIR:\?[^\n]*\}\n *target: \/etc\/caddy\/origin\n *read_only: true\n *bind:\n *create_host_path: false *$/m,
+    `deploy/${COMPOSE_FILE}: caddy's /etc/caddy/origin bind must be written in the long syntax, read-only, with create_host_path: false`,
+  );
+  // Nobody else sees the folder, under any name: the setting appears once in the compose, in
+  // caddy's service, and no other mount renders to its path.
+  const uses = composeText().split(/\r?\n/).filter((l) => !/^\s*#/.test(l) && l.includes('${ORIGIN_TLS_DIR'));
+  assert.equal(uses.length, 1, `ORIGIN_TLS_DIR is used ${uses.length} times in deploy/${COMPOSE_FILE}`);
+  assert.ok(serviceText('caddy').includes(uses[0]), 'ORIGIN_TLS_DIR is used outside the caddy service');
+  const sameSource = all.filter((m) => m.service !== 'caddy' && posix(m.source ?? '') === posix(origin[0].source));
+  assert.deepEqual(sameSource.map((m) => `${m.service}: ${m.target}`), [], 'another service mounts ORIGIN_TLS_DIR');
+  // The edge reads exactly these files from it (deploy/Caddyfile).
+  const caddyfile = readText(path.join(DEPLOY_DIR, 'Caddyfile'));
+  const files = [...new Set([...caddyfile.matchAll(/\/etc\/caddy\/origin\/([\w.-]+)/g)].map((m) => m[1]))].sort();
+  console.log(`ORIGIN_TLS_DIR: mounted into caddy only, read-only; the Caddyfile reads ${files.join(', ')}`);
+  assert.deepEqual(files, ['origin-cert.pem', 'origin-key.pem', 'origin-pull-ca.pem']);
 });
 
 /**
@@ -473,10 +564,22 @@ test('F-29: caddy passes only stored public images to the media file server and 
   for (const folder of privateFolders) assert.ok(!expected.includes(folder), `private folder ${folder} is served`);
   const upload = caddyHandlers(routes[uploadAt]);
   assert.deepEqual(upload.map((h) => h.handler), ['subroute', 'headers', 'reverse_proxy']);
-  // Set when the answer is written: the sandbox policy is sent whatever the file server answers.
+  // Set when the answer is written: the sandbox policy and the cache lifetime are sent whatever
+  // the file server answers.
   assert.equal(upload[1].response.deferred, true, 'the upload policy is not deferred');
   assert.match(upload[1].response.set['Content-Security-Policy'][0], /default-src 'none'.*sandbox/);
+  // Cloudflare caches .jpg, .png and .webp by extension (120 minutes when the origin says
+  // nothing): five minutes, so a removed image leaves its cache within that time.
+  assert.deepEqual(upload[1].response.set['Cache-Control'], ['public, max-age=300']);
   assert.deepEqual(upload[2].upstreams.map((u) => u.dial), ['media:8080']);
+  // No other route and no error route of the edge says anything about caching: Laravel's
+  // answers keep their own Cache-Control (no-cache, private; the ban evidence no-store, private).
+  const isCacheControl = (name) => name.toLowerCase() === 'cache-control';
+  const setsCacheControl = (h) => [h.response, h.headers?.response].some((ops) => ['set', 'add', 'replace'].some((op) => Object.keys(ops?.[op] ?? {}).some(isCacheControl)))
+    || (h.handler === 'static_response' && Object.keys(h.headers ?? {}).some(isCacheControl));
+  const setters = caddyHandlers(caddyAdapt()).filter(setsCacheControl);
+  assert.equal(setters.length, 1, `handlers that set Cache-Control: ${setters.length}`);
+  assert.equal(setters[0], upload[1], 'Cache-Control is set elsewhere than on the upload route');
   assert.deepEqual(caddyHandlers(routes[storageAt]).map((h) => [h.handler, h.status_code ?? null]), [['subroute', null], ['static_response', 404]]);
   assert.equal(routes[storageAt].match[0].path.includes('/storage'), true);
   assert.deepEqual(caddyHandlers(caddyAdapt()).filter((h) => h.handler === 'file_server'), [], 'the edge serves files itself');
@@ -530,12 +633,23 @@ test('F-29: media is a file server without secrets: no settings, no keys, nobody
 // ------------------------------------------------------------------------------ F-30
 
 test('F-30: the Caddyfile validates and sets the security headers on normal and error routes', () => {
-  const r = dockerRun(serviceImage('caddy'), {
-    mounts: [{ src: path.join(DEPLOY_DIR, 'Caddyfile'), dst: '/etc/caddy/Caddyfile' }],
-    env: { DOMAIN: 'localhost' },
-    args: ['caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'],
-  });
-  assert.equal(r.status, 0, r.stderr);
+  // `caddy validate` loads the certificate, its key and the client CA: with throw-away files,
+  // mounted where the compose mounts ORIGIN_TLS_DIR.
+  const pki = throwawayPki('localhost');
+  try {
+    const r = dockerRun(serviceImage('caddy'), {
+      mounts: [
+        { src: path.join(DEPLOY_DIR, 'Caddyfile'), dst: '/etc/caddy/Caddyfile' },
+        { src: pki.edgeDir, dst: '/etc/caddy/origin' },
+      ],
+      env: { DOMAIN: 'localhost' },
+      args: ['caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'],
+    });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout + r.stderr, /Valid configuration/);
+  } finally {
+    pki.remove();
+  }
 
   const server = caddyAdapt().apps.http.servers.srv0;
   const places = { routes: server.routes, 'error routes': server.errors?.routes };
@@ -556,11 +670,57 @@ test('F-30: the Caddyfile validates and sets the security headers on normal and 
   }
 });
 
-test("F-31: caddy sends the client's TCP address to Laravel and overwrites a client-sent X-Forwarded-For", () => {
+test("F-31: caddy takes the visitor's address from CF-Connecting-IP and sets every forwarding header Laravel trusts", () => {
+  const server = caddyAdapt().apps.http.servers.srv0;
+  // CF-Connecting-IP from any source: safe only because no handshake completes without
+  // Cloudflare's client certificate ("every TLS connection policy requires ..." below).
+  assert.deepEqual(server.trusted_proxies, { ranges: ['0.0.0.0/0', '::/0'], source: 'static' });
+  assert.deepEqual(server.client_ip_headers, ['CF-Connecting-IP']);
+  // Laravel trusts For, Host and Proto from caddy (api/bootstrap/app.php; TRUSTED_PROXIES is
+  // caddy's address). With every source trusted, caddy would pass on what a client sent: it SETS
+  // each of the three instead.
+  const bootstrap = readText(path.join(REPO_ROOT, 'api', 'bootstrap', 'app.php'));
+  const trusted = /trustProxies\(\s*headers:\s*([^,]+),/.exec(bootstrap)?.[1].match(/HEADER_X_FORWARDED_[A-Z]+/g)?.sort();
+  assert.deepEqual(trusted, ['HEADER_X_FORWARDED_FOR', 'HEADER_X_FORWARDED_HOST', 'HEADER_X_FORWARDED_PROTO'], 'the forwarding headers Laravel trusts');
   const proxy = edgeProxies().api ?? [];
   assert.equal(proxy.length, 1);
-  assert.deepEqual(proxy[0].headers?.request?.set?.['X-Forwarded-For'], ['{http.request.remote.host}']);
-  assert.deepEqual(proxy[0].headers?.request?.set?.['X-Forwarded-Proto'], ['{http.request.scheme}']);
+  const set = proxy[0].headers?.request?.set ?? {};
+  assert.deepEqual(set['X-Forwarded-For'], ['{http.vars.client_ip}'], 'the address Caddy took from CF-Connecting-IP');
+  assert.deepEqual(set['X-Forwarded-Host'], ['{http.request.host}']);
+  assert.deepEqual(set['X-Forwarded-Proto'], ['{http.request.scheme}']);
+});
+
+test('edge: every TLS connection policy requires the client certificate of the origin-pull CA; 443 only, no ACME, and no setting reaches it', () => {
+  const config = caddyAdapt();
+  const servers = Object.values(config.apps.http.servers);
+  assert.equal(servers.length, 1, 'the edge runs one server');
+  const [server] = servers;
+  assert.deepEqual(server.listen, [':443'], 'the edge listens on 443 only');
+  assert.equal(server.automatic_https?.disable, true, 'automatic HTTPS (ACME and the port-80 redirect) is on');
+  assert.equal(server.strict_sni_host, true, 'the Host header may differ from the TLS server name');
+  assert.deepEqual(server.protocols, ['h1', 'h2'], 'HTTP/3 would listen on UDP 443');
+  // Every policy, the catch-all for other names and for a handshake without a name included.
+  const policies = server.tls_connection_policies ?? [];
+  const ca = JSON.stringify({ pem_files: ['/etc/caddy/origin/origin-pull-ca.pem'], provider: 'file' });
+  console.log(`edge: ${policies.length} TLS connection policies (${policies.map((p) => p.match?.sni?.join(',') ?? 'any other name, or none').join('; ')})`);
+  const open = policies.filter((p) => p.client_authentication?.mode !== 'require_and_verify' || JSON.stringify(p.client_authentication?.ca) !== ca);
+  assert.deepEqual(open.map((p) => JSON.stringify(p)), [], 'a TLS policy that completes a handshake without the client certificate');
+  assert.deepEqual(policies.map((p) => p.match?.sni ?? null), [['localhost'], null], 'one policy for DOMAIN and one for every other name');
+  // The site for every other name answers nothing: it closes the connection.
+  const routes = server.routes;
+  assert.deepEqual(routes.map((r) => r.match?.[0]?.host ?? null), [['localhost'], null]);
+  assert.deepEqual(caddyHandlers(routes[1]).map((h) => [h.handler, h.abort ?? null]), [['subroute', null], ['static_response', true]]);
+  // The certificate pair is the files of ORIGIN_TLS_DIR; nothing is fetched, issued or stapled.
+  const tls = config.apps.tls;
+  assert.deepEqual(Object.keys(tls.certificates ?? {}), ['load_files'], 'certificates from somewhere else');
+  assert.deepEqual(tls.certificates.load_files.map((f) => [f.certificate, f.key]), [['/etc/caddy/origin/origin-cert.pem', '/etc/caddy/origin/origin-key.pem']]);
+  assert.ok(!JSON.stringify(tls).includes('"issuers"'), 'an ACME or other issuer');
+  assert.equal(tls.disable_ocsp_stapling, true, 'OCSP stapling (a call out) is on');
+  assert.deepEqual(Object.keys(config.apps).sort(), ['http', 'tls'], 'another app (pki: a CA of its own)');
+  // No setting reaches the TLS rules: caddy gets DOMAIN only, the Caddyfile's only placeholder.
+  assert.deepEqual(Object.keys(base().services.caddy.environment ?? {}), ['DOMAIN'], "caddy's settings");
+  const code = readText(path.join(DEPLOY_DIR, 'Caddyfile')).split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+  assert.deepEqual([...new Set([...code.matchAll(/\{\$[^}]*\}|\{env\.[^}]*\}/g)].map((m) => m[0]))], ['{$DOMAIN}'], 'a setting reaches the Caddyfile');
 });
 
 test('request bodies: 9 MB only for multipart uploads, otherwise the largest body limit of the backends', () => {
@@ -784,11 +944,13 @@ test('F-17: backups go to the required BACKUP_DIR bind, never created implicitly
   assert.deepEqual({ type: ciBackup.type, source: ciBackup.source }, { type: 'volume', source: 'ci-backups' });
 });
 
-test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the env file without printing values', () => {
+test('F-17: the preflight refuses a BACKUP_DIR inside the clone, checks the edge\'s TLS files and the env file, without printing values', () => {
   const secrets = Object.entries(ciValues()).filter(([k, v]) => /PASSWORD|SECRET|_KEY$/.test(k) && v !== '').map(([, v]) => v);
-  // Runs inside the db image (bash, coreutils): the file modes a check needs exist only on a
-  // Linux file system. A stand-in `docker` records its arguments, so the last check's call is
-  // visible without a Docker daemon in the container.
+  // Runs inside the db image (bash, coreutils, openssl): the file modes a check needs exist only
+  // on a Linux file system. A stand-in `docker` records its arguments, so the last check's call is
+  // visible without a Docker daemon in the container. The TLS files are throw-away ones
+  // (deploy/test/throwaway-pki.sh, for DOMAIN=localhost as in deploy/ci.env), made in here as
+  // root: the key root's with mode 600, the certificate and the CA with mode 644.
   const driver = [
     'set -u',
     'mkdir -p /work /clone/backups',
@@ -802,7 +964,18 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     'install -d -m 700 /work/backups',
     'install -d -m 755 /work/open',
     'ln -s /clone/backups /work/into-clone',
-    'envfile() { sed "s|^BACKUP_DIR=.*|BACKUP_DIR=$1|" /clone/deploy/ci.env > /work/prod.env; chmod 600 /work/prod.env; }',
+    'sh /opt/throwaway-pki.sh /work/pki localhost > /dev/null',
+    'cp -a /work/pki/edge /work/tls',
+    // Certificates that fit only in part: expired long ago, another name, another key; a CA that
+    // expired long ago.
+    "openssl req -x509 -new -key /work/pki/edge/origin-key.pem -sha256 -subj /CN=localhost -addext 'subjectAltName=DNS:localhost' -not_before 20200101000000Z -not_after 20200102000000Z -out /work/cert-expired.pem 2>/dev/null",
+    "openssl req -x509 -new -key /work/pki/edge/origin-key.pem -sha256 -subj /CN=other.example.invalid -addext 'subjectAltName=DNS:other.example.invalid' -days 1 -out /work/cert-other-name.pem 2>/dev/null",
+    'openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out /work/other.key 2>/dev/null',
+    "openssl req -x509 -new -key /work/other.key -sha256 -subj /CN=localhost -addext 'subjectAltName=DNS:localhost' -days 1 -out /work/cert-other-key.pem 2>/dev/null",
+    "openssl req -x509 -new -key /work/other.key -sha256 -subj '/CN=expired CA' -addext 'basicConstraints=critical,CA:TRUE' -not_before 20200101000000Z -not_after 20200102000000Z -out /work/ca-expired.pem 2>/dev/null",
+    'envfile() { sed -e "s|^BACKUP_DIR=.*|BACKUP_DIR=$1|" -e "s|^ORIGIN_TLS_DIR=.*|ORIGIN_TLS_DIR=${2:-/work/tls}|" /clone/deploy/ci.env > /work/prod.env; chmod 600 /work/prod.env; }',
+    // A fresh copy of the good TLS files for one case, at /work/case.
+    'tlscase() { rm -rf /work/case; cp -a /work/pki/edge /work/case; envfile /work/backups /work/case; }',
     "run() { out=$(bash /clone/deploy/scripts/preflight.sh \"${ENV_FILE:-/work/prod.env}\" 2>&1); code=$?; printf '=== %s exit %s\\n%s\\n' \"$1\" \"$code\" \"$out\"; }",
     'envfile /work/backups; run ok; echo "docker: $(cat /work/docker-args)"',
     'envfile relative/backups; run relative',
@@ -820,13 +993,43 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     "envfile /work/backups; sed -i 's/^TOKEN_RETENTION_DAYS=.*/TOKEN_RETENTION_DAYS=7d/' /work/prod.env; run token-days",
     "envfile /work/backups; sed -i 's/^PAYMENTS_MODE=.*/PAYMENTS_MODE=on/' /work/prod.env; run payments-on",
     "envfile /work/backups; sed -i 's/^PAYMENTS_MODE=.*/PAYMENTS_MODE=off/' /work/prod.env; run payments-off",
+    "envfile /work/backups; sed -i 's/^MAIL_MAILER=.*/MAIL_MAILER=/' /work/prod.env; run mailer-empty",
+    ...OTHER_MAILERS.map((mailer) => `envfile /work/backups; sed -i 's/^MAIL_MAILER=.*/MAIL_MAILER=${mailer}/' /work/prod.env; run mailer-${mailer}`),
+    "envfile /work/backups; sed -i 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' /work/prod.env; run graph-no-client",
+    "envfile /work/backups; sed -i -e 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' -e 's/^MAIL_GRAPH_CLIENT_ID=.*/MAIL_GRAPH_CLIENT_ID=not-a-guid/' /work/prod.env; run graph-client-not-a-guid",
+    "envfile /work/backups; sed -i -e 's/^MAIL_MAILER=.*/MAIL_MAILER=graph/' -e 's/^MAIL_GRAPH_CLIENT_ID=.*/MAIL_GRAPH_CLIENT_ID=00000000-0000-4000-8000-00000000000b/' -e 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run graph-ok",
+    "envfile /work/backups; sed -i 's/^MAIL_HOST=.*/MAIL_HOST=/' /work/prod.env; run smtp-no-host",
+    "envfile /work/backups; sed -i 's/^MAIL_FROM_ADDRESS=.*/MAIL_FROM_ADDRESS=not-an-address/' /work/prod.env; run sender-not-an-address",
+    "envfile /work/backups; sed -i 's/^APP_NET_PREFIX=.*/APP_NET_PREFIX=172.30/' /work/prod.env; run prefix-two-parts",
+    "envfile /work/backups; sed -i 's/^APP_NET_PREFIX=.*/APP_NET_PREFIX=172.30.099/' /work/prod.env; run prefix-leading-zero",
+    // The TLS folder and its three files.
+    'envfile /work/backups relative/tls; run tls-relative',
+    'envfile /work/backups /work/no-such-folder; run tls-missing',
+    'cp -a /work/pki/edge /clone/tls; envfile /work/backups /clone/tls; run tls-inside-clone',
+    'tlscase; chmod 777 /work/case; run tls-open',
+    'tlscase; chown 1000 /work/case; run tls-not-root',
+    'tlscase; rm /work/case/origin-key.pem; run key-missing',
+    'tlscase; chmod 644 /work/case/origin-key.pem; run key-readable',
+    'tlscase; mv /work/case/origin-key.pem /work/key-elsewhere.pem; ln -s /work/key-elsewhere.pem /work/case/origin-key.pem; run key-link',
+    'tlscase; cat /work/pki/edge/origin-cert.pem > /work/case/origin-key.pem; run key-not-a-key',
+    'tlscase; rm /work/case/origin-cert.pem; run cert-missing',
+    "tlscase; echo 'not a certificate' > /work/case/origin-cert.pem; run cert-not-a-certificate",
+    'tlscase; cat /work/cert-expired.pem > /work/case/origin-cert.pem; run cert-expired',
+    'tlscase; cat /work/cert-other-name.pem > /work/case/origin-cert.pem; run cert-other-name',
+    'tlscase; cat /work/cert-other-key.pem > /work/case/origin-cert.pem; run cert-other-key',
+    'tlscase; chmod 666 /work/case/origin-cert.pem; run cert-open',
+    'tlscase; rm /work/case/origin-pull-ca.pem; run ca-missing',
+    "tlscase; echo 'not a certificate' > /work/case/origin-pull-ca.pem; run ca-not-a-certificate",
+    'tlscase; cat /work/ca-expired.pem > /work/case/origin-pull-ca.pem; run ca-expired',
+    'tlscase; chmod 666 /work/case/origin-pull-ca.pem; run ca-open',
+    'tlscase; chmod 400 /work/case/origin-key.pem; run key-400',
     'envfile /work/backups; DB_PASSWORD=shell-value-not-a-secret run shell-export',
     'envfile /work/backups; FAKE_DOCKER_STATUS=1 run compose-fails',
     'ENV_FILE=/work/none.env run no-env-file',
   ].join('\n');
   assert.ok(fs.existsSync(path.join(DEPLOY_DIR, 'scripts', 'preflight.sh')), 'no deploy/scripts/preflight.sh');
   const r = dockerRun(serviceImage('db'), {
-    mounts: [{ src: DEPLOY_DIR, dst: '/clone/deploy' }],
+    mounts: [{ src: DEPLOY_DIR, dst: '/clone/deploy' }, { src: THROWAWAY_PKI, dst: '/opt/throwaway-pki.sh' }],
     entrypoint: 'bash',
     args: ['-c', driver],
   });
@@ -854,10 +1057,43 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     'token-days': [1, 'FAIL  TOKEN_RETENTION_DAYS has a valid form: whole days, at least 1'],
     'payments-on': [1, 'FAIL  PAYMENTS_MODE has a valid form: off or test'],
     'payments-off': [0, null],
+    'mailer-empty': [1, 'FAIL  MAIL_MAILER has a valid form: graph or smtp'],
+    ...Object.fromEntries(OTHER_MAILERS.map((mailer) => [`mailer-${mailer}`, [1, 'FAIL  MAIL_MAILER has a valid form: graph or smtp']])),
+    'graph-no-client': [1, "FAIL  MAIL_GRAPH_CLIENT_ID has a valid form: the managed identity's client ID, a GUID"],
+    'graph-client-not-a-guid': [1, "FAIL  MAIL_GRAPH_CLIENT_ID has a valid form: the managed identity's client ID, a GUID"],
+    'graph-ok': [0, null],
+    'smtp-no-host': [1, 'FAIL  MAIL_HOST is set (MAIL_MAILER=smtp)'],
+    'sender-not-an-address': [1, 'FAIL  MAIL_FROM_ADDRESS has a valid form: an e-mail address'],
+    // scripts/metadata-access.sh builds the host rules from it and refuses the same.
+    'prefix-two-parts': [1, 'FAIL  APP_NET_PREFIX has a valid form: three numbers from 0 to 255'],
+    'prefix-leading-zero': [1, 'FAIL  APP_NET_PREFIX has a valid form: three numbers from 0 to 255'],
+    'tls-relative': [1, 'FAIL  ORIGIN_TLS_DIR is an absolute path'],
+    'tls-missing': [1, 'FAIL  ORIGIN_TLS_DIR is an existing directory'],
+    'tls-inside-clone': [1, 'FAIL  ORIGIN_TLS_DIR lies outside this clone'],
+    'tls-open': [1, 'FAIL  ORIGIN_TLS_DIR belongs to root and only root can change it'],
+    'tls-not-root': [1, 'FAIL  ORIGIN_TLS_DIR belongs to root and only root can change it'],
+    'key-missing': [1, 'FAIL  ORIGIN_TLS_DIR/origin-key.pem is a file, not a symbolic link'],
+    'key-readable': [1, 'FAIL  origin-key.pem belongs to root with mode 600 or 400'],
+    // A link would point to a path that does not exist inside caddy's container.
+    'key-link': [1, 'FAIL  ORIGIN_TLS_DIR/origin-key.pem is a file, not a symbolic link'],
+    'key-not-a-key': [1, 'FAIL  origin-key.pem holds a private key'],
+    'key-400': [0, null],
+    'cert-missing': [1, 'FAIL  ORIGIN_TLS_DIR/origin-cert.pem is a file, not a symbolic link'],
+    'cert-not-a-certificate': [1, 'FAIL  origin-cert.pem holds a certificate'],
+    'cert-expired': [1, 'FAIL  origin-cert.pem has not expired (Cloudflare would answer 526)'],
+    'cert-other-name': [1, 'FAIL  origin-cert.pem names DOMAIN'],
+    'cert-other-key': [1, 'FAIL  origin-cert.pem belongs to origin-key.pem'],
+    'cert-open': [1, 'FAIL  origin-cert.pem belongs to root and only root can change it'],
+    'ca-missing': [1, 'FAIL  ORIGIN_TLS_DIR/origin-pull-ca.pem is a file, not a symbolic link'],
+    'ca-not-a-certificate': [1, 'FAIL  origin-pull-ca.pem holds a certificate'],
+    'ca-expired': [1, 'FAIL  origin-pull-ca.pem has not expired (every handshake with Cloudflare would fail: 525)'],
+    'ca-open': [1, 'FAIL  origin-pull-ca.pem belongs to root and only root can change it'],
     'shell-export': [1, "FAIL  set in this shell as well, docker compose would use the shell's value (unset them): DB_PASSWORD"],
     'compose-fails': [1, 'FAIL  docker compose renders the production compose'],
     'no-env-file': [1, 'FAIL  the env file exists'],
   };
+  // The TLS cases that break one thing fail one check: each check stands on its own.
+  const single = ['tls-inside-clone', 'tls-open', 'tls-not-root', 'key-readable', 'cert-not-a-certificate', 'cert-expired', 'cert-other-name', 'cert-other-key', 'cert-open', 'ca-not-a-certificate', 'ca-expired', 'ca-open'];
   assert.deepEqual(Object.keys(runs).sort(), Object.keys(expected).sort(), r.stdout);
   console.log(`preflight: ${Object.keys(expected).length} cases`);
   for (const [name, [code, line]] of Object.entries(expected)) {
@@ -865,9 +1101,13 @@ test('F-17: the preflight refuses a BACKUP_DIR inside the clone and checks the e
     assert.equal(runs[name].code, code, `${name}:\n${out}`);
     if (line) assert.ok(out.includes(line), `${name}: expected "${line}" in:\n${out}`);
     assert.match(out, /preflight: \d+ checks, \d+ failed/, `${name}: no total`);
+    if (single.includes(name)) assert.match(out, /preflight: \d+ checks, 1 failed/, `${name}: more than one check failed:\n${out}`);
     for (const value of [...secrets, 'shell-value-not-a-secret']) assert.ok(!out.includes(value), `${name} printed a value`);
+    assert.doesNotMatch(out, /-----BEGIN/, `${name} printed a key or a certificate`);
   }
-  assert.match(runs.ok.out, /preflight: 1[0-9] checks, 0 failed/);
+  // Every check passed with the good files: the key at mode 600, and at 400 (key-400); the
+  // certificate and the CA at mode 644, readable by everyone.
+  assert.match(runs.ok.out, /preflight: 34 checks, 0 failed/);
   assert.match(r.stdout, /^docker: compose --project-directory \/clone\/deploy --env-file \/work\/prod\.env -f \/clone\/deploy\/docker-compose\.yml config --quiet $/m);
 });
 
@@ -908,6 +1148,19 @@ for i in $(seq 1 64); do head -c 16384 /dev/urandom > /data/uploads/posts/file-$
 head -c 100 /dev/urandom > /data/private-media/evidence/kept.png
 cat > /usr/local/bin/sleep <<'EOF'
 #!/bin/sh
+# Under as_daemon, the daemon's wait for the next night: the first one lets the night pass (every
+# file in /backups two days older, and a real second, so the next stamp differs), the second one
+# stops the daemon.
+if [ -e /work/daemon ]; then
+  n=$(( $(cat /work/daemon) + 1 )); echo "$n" > /work/daemon
+  if [ "$n" -eq 1 ]; then
+    for f in /backups/*; do [ -f "$f" ] && touch -d "@$(( $(stat -c %Y "$f") - 172800 ))" "$f"; done
+    /usr/bin/sleep 1.1
+  else
+    kill -TERM "$PPID"
+  fi
+  exit 0
+fi
 echo "$1" >> /work/sleeps
 echo $(( $(cat /work/clock) + $1 )) > /work/clock
 EOF
@@ -938,9 +1191,16 @@ EOF
 chmod 755 /usr/local/bin/sleep /usr/local/bin/mysqladmin /usr/local/bin/mysqldump /usr/local/bin/tar
 export BACKUP_RETENTION_DAYS=7 DB_HOST=db DB_DATABASE=d DB_USERNAME=u DB_PASSWORD=stand-in-not-a-secret TAR_MODE= DB_UP_AFTER=0
 once() {
-  rm -rf /backups/* /backups/.[!.]* /work/sleeps /work/pings /work/dumps /data/uploads/added-while-archiving
+  rm -rf /backups/* /backups/.[!.]*
+  run "$1"
+}
+# run <name> [<argument>]: one run (--once unless the argument says otherwise) on the sets
+# already in /backups (plant puts them there), and what happened.
+run() {
+  rm -f /work/sleeps /work/pings /work/dumps /data/uploads/added-while-archiving
   echo 0 > /work/clock
-  out=$(bash /opt/deploy/backup.sh --once 2>&1); code=$?
+  mode=--once; [ "$#" -ge 2 ] && mode=$2
+  out=$(bash /opt/deploy/backup.sh "$mode" 2>&1); code=$?
   printf '=== %s exit %s\n%s\n' "$1" "$code" "$out"
   echo "check: $(bash /opt/deploy/backup.sh --check 2>&1)"
   echo "sleeps: $(cat /work/sleeps 2>/dev/null | wc -l) of $(sort -u /work/sleeps 2>/dev/null | tr '\n' ' ')s"
@@ -950,6 +1210,31 @@ once() {
   latest=$(ls /backups | grep '^uploads-' | tail -n 1)
   echo "sets: $(ls /backups | grep -c '^uploads-')"
   echo "archived files: $(if [ -n "$latest" ]; then /usr/bin/tar -tzf "/backups/$latest" | grep -c -v '/$'; else echo none; fi)"
+  leftover
+}
+# Every stamp left, oldest first, with how many of its three files are there.
+leftover() {
+  echo "left: $(ls /backups | sed -n -E 's/^(db-|uploads-|SHA256SUMS-)([0-9]{8}T[0-9]{6}Z).*$/\2/p' | sort | uniq -c | awk '{printf "%s:%s ", $2, $1}')"
+}
+# as_daemon <name>: the service itself (backup.sh without an argument), through its run at start
+# and one nightly run; the stand-in sleep lets the night pass in between and then stops it.
+as_daemon() {
+  rm -f /work/sleeps /work/pings /work/dumps; echo 0 > /work/clock; echo 0 > /work/daemon
+  out=$(timeout 120 bash /opt/deploy/backup.sh 2>&1); code=$?
+  rm -f /work/daemon
+  printf '=== %s exit %s\n%s\n' "$1" "$code" "$out"
+  leftover
+}
+# plant <age in minutes> [<age of its SHA256SUMS file>]: a set as a run that long ago left it, its
+# stamp from that time, on an empty or planted /backups (fresh empties it). Prints the stamp.
+fresh() { rm -rf /backups/* /backups/.[!.]*; }
+plant() {
+  sums=$1; [ "$#" -ge 2 ] && sums=$2
+  now=$(date -u +%s); t=$(( now - $1 * 60 )); u=$(( now - sums * 60 ))
+  stamp=$(date -u -d "@$t" +%Y%m%dT%H%M%SZ)
+  for f in "db-$stamp.sql.gz" "uploads-$stamp.tar.gz"; do echo planted > "/backups/$f"; touch -d "@$t" "/backups/$f"; done
+  echo planted > "/backups/SHA256SUMS-$stamp"; touch -d "@$u" "/backups/SHA256SUMS-$stamp"
+  echo "$stamp"
 }
 `;
 
@@ -1017,6 +1302,119 @@ test('F-17: the backup waits for the database without credentials and for a boun
   }
 });
 
+test("F-17: prune keeps the newest BACKUP_RETENTION_DAYS sets whatever their age, deletes the older ones by age as before, a set's files together, and nothing after a failed run", () => {
+  // BACKUP_STAND_INS runs with BACKUP_RETENTION_DAYS=7. Ages in minutes, oldest set first; a pair
+  // is [the age of db- and uploads-, the age of SHA256SUMS-].
+  const DAY = 1440;
+  const RETENTION = 7;
+  const ages = {
+    // A server restored from a restore point older than the retention: every set it holds is old.
+    restore: [20, 19, 18, 17, 16, 15, 14, 13, 12].map((d) => d * DAY),
+    // One set a night.
+    normal: [9.5, 8.5, 7.5, 6.5, 5.5, 4.5, 3.5, 2.5, 1.5, 0.5].map((d) => d * DAY),
+    // Beyond the newest sets: one set all old, two whose files lie on both sides of the limit.
+    together: [8 * DAY, [7 * DAY + 120, 7 * DAY - 120], [7 * DAY - 120, 7 * DAY + 120], 360, 300, 240, 180, 120, 60],
+    // More old sets than the retention, then a run that fails.
+    failed: [19, 18, 17, 16, 15, 14, 13, 12, 11, 10].map((d) => d * DAY),
+  };
+  const planting = (list) => `fresh; p=''; ${list.map((a) => `p="$p $(plant ${[a].flat().join(' ')})"`).join('; ')}`;
+  const runs = backupCases([
+    `${planting(ages.restore)}; run restore; echo "planted:$p"`,
+    `${planting(ages.normal)}; run normal; echo "planted:$p"`,
+    `${planting(ages.together)}; run together; echo "planted:$p"`,
+    `${planting(ages.failed)}; export TAR_MODE=broken; run failed; echo "planted:$p"; export TAR_MODE=`,
+  ]);
+  assert.deepEqual(Object.keys(runs), ['restore', 'normal', 'together', 'failed']);
+  const planted = (r) => String(r.planted ?? '').trim().split(/\s+/).filter(Boolean);
+  // { stamp: how many of its three files are left }
+  const left = (r) => Object.fromEntries(String(r.left ?? '').trim().split(/\s+/).filter(Boolean).map((e) => e.split(':')).map(([s, n]) => [s, Number(n)]));
+  const written = (r) => Object.keys(left(r)).filter((s) => !planted(r).includes(s));
+  console.log(`prune: ${Object.entries(runs).map(([n, r]) => `${n}: exit ${r.code}, ${planted(r).length} planted, ${Object.keys(left(r)).length} left`).join('; ')}`);
+  for (const [name, r] of Object.entries(runs)) {
+    assert.equal(planted(r).length, ages[name].length, `${name}: planting failed`);
+    assert.deepEqual(Object.entries(left(r)).filter(([, n]) => n !== 3).map(([s, n]) => `${s}: ${n} of 3 files`), [], `${name}: a set was split`);
+  }
+
+  // The restore case: every planted set is older than the retention, and the newest of them stay
+  // with the run's own new set, which makes up the newest RETENTION.
+  const { restore, normal, together, failed } = runs;
+  assert.equal(restore.code, 0, restore.out);
+  assert.equal(written(restore).length, 1, 'restore: the run did not write one set');
+  assert.deepEqual(Object.keys(left(restore)).sort(), [...planted(restore).slice(-(RETENTION - 1)), ...written(restore)].sort(), 'restore: not the newest sets kept');
+  assert.match(restore.out, /^backup: pruned 9 file\(s\)/m);
+
+  // The normal case, as before: the sets older than the retention go, the younger ones stay.
+  assert.equal(normal.code, 0, normal.out);
+  const young = planted(normal).filter((s, i) => ages.normal[i] <= RETENTION * DAY);
+  assert.deepEqual(Object.keys(left(normal)).sort(), [...young, ...written(normal)].sort(), 'normal: not what deleting by age leaves');
+  assert.match(normal.out, /^backup: pruned 9 file\(s\)/m);
+
+  // A set goes only when all its files are old, and then with all three.
+  assert.equal(together.code, 0, together.out);
+  assert.deepEqual(Object.keys(left(together)).sort(), [...planted(together).slice(1), ...written(together)].sort(), 'together: a set whose files lie on both sides of the limit was deleted, or the old set was kept');
+  assert.match(together.out, /^backup: pruned 3 file\(s\)/m);
+
+  // A failed run deletes nothing, however old the sets.
+  assert.notEqual(failed.code, 0, 'failed: the run passed');
+  assert.deepEqual(Object.keys(left(failed)).sort(), [...planted(failed)].sort(), 'failed: a set was deleted');
+  assert.ok(failed.out.includes('nothing was deleted'), `failed:\n${failed.out}`);
+});
+
+test('F-17: the run at start deletes nothing, however often the service starts; with BACKUP_RETENTION_DAYS=1 a nightly run and one by hand keep exactly the newest set', () => {
+  // A server restored from a restore point older than the retention: five sets, all older than a
+  // day, before each case.
+  const DAY = 1440;
+  const planting = `fresh; p=''; ${[14, 13, 12, 11, 10].map((d) => `p="$p $(plant ${d * DAY})"`).join('; ')}`;
+  const runs = backupCases([
+    'export BACKUP_RETENTION_DAYS=1',
+    `${planting}; run start --at-start; echo "planted:$p"`,
+    // A second start, a second later (a stamp of its own): a Docker restart, a `docker compose up -d`.
+    `${planting}; run first-start --at-start; /usr/bin/sleep 1.1; run two-starts --at-start; echo "planted:$p"`,
+    `${planting}; run by-hand --once; echo "planted:$p"`,
+    // The service itself: its run at start, the night, its nightly run.
+    `${planting}; as_daemon nightly; echo "planted:$p"`,
+  ]);
+  assert.deepEqual(Object.keys(runs), ['start', 'first-start', 'two-starts', 'by-hand', 'nightly']);
+  const planted = (r) => String(r.planted ?? '').trim().split(/\s+/).filter(Boolean);
+  const left = (r) => Object.fromEntries(String(r.left ?? '').trim().split(/\s+/).filter(Boolean).map((e) => e.split(':')).map(([s, n]) => [s, Number(n)]));
+  const sets = (r) => Object.keys(left(r)).sort();
+  console.log(`retention 1: ${Object.entries(runs).map(([n, r]) => `${n}: exit ${r.code}, ${sets(r).length} set(s) left`).join('; ')}`);
+  for (const [name, r] of Object.entries(runs)) {
+    assert.equal(r.code, 0, `${name}:\n${r.out}`);
+    assert.deepEqual(Object.entries(left(r)).filter(([, n]) => n !== 3).map(([s, n]) => `${s}: ${n} of 3 files`), [], `${name}: a set was split`);
+  }
+  const { start, 'two-starts': twoStarts, 'by-hand': byHand, nightly } = runs;
+  const fiveOld = planted(start);
+  assert.equal(fiveOld.length, 5, 'start: planting failed');
+
+  // The run at start: its own set next to all the old ones, nothing deleted.
+  assert.equal(sets(start).length, 6, `start: ${start.left}`);
+  assert.deepEqual(fiveOld.filter((s) => !sets(start).includes(s)), [], 'start: the run at start deleted an old set');
+  assert.match(start.out, /^backup: the run at start deletes nothing; the next nightly run deletes old sets$/m);
+  assert.doesNotMatch(start.out, /pruned|deleted /, 'start: the run at start pruned');
+
+  // Two starts in a row: two sets of their own, still nothing deleted.
+  assert.equal(sets(twoStarts).length, 7, `two-starts: ${twoStarts.left}`);
+  assert.deepEqual(planted(twoStarts).filter((s) => !sets(twoStarts).includes(s)), [], 'two-starts: a start deleted an old set');
+  assert.doesNotMatch(runs['first-start'].out + twoStarts.out, /pruned|deleted /, 'two-starts: a run at start pruned');
+
+  // A run by hand prunes: the newest set is its own, and it is the only one left.
+  assert.equal(sets(byHand).length, 1, `by-hand: ${byHand.left}`);
+  assert.ok(!planted(byHand).includes(sets(byHand)[0]), 'by-hand: an old set is left instead of the run\'s own');
+  assert.match(byHand.out, /^backup: pruned 15 file\(s\)/m);
+
+  // The service: its run at start deletes nothing; the night passes (every set two days older);
+  // the nightly run then keeps exactly the newest set, its own.
+  assert.match(nightly.out, /^backup: nightly at \d\d:\d\d UTC; .*first run now, which deletes nothing$/m);
+  assert.equal((nightly.out.match(/^backup: run \S+ written: /gm) ?? []).length, 2, `nightly: not a run at start and a nightly run:\n${nightly.out}`);
+  assert.match(nightly.out, /^backup: the run at start deletes nothing; the next nightly run deletes old sets$/m);
+  // The five old sets and the one of the run at start.
+  assert.match(nightly.out, /^backup: pruned 18 file\(s\)/m);
+  assert.equal(sets(nightly).length, 1, `nightly: ${nightly.left}`);
+  assert.ok(!planted(nightly).includes(sets(nightly)[0]), 'nightly: an old set is left instead of the nightly run\'s own');
+  assert.match(nightly.out, /^backup: stopping$/m);
+});
+
 test('settings checked in two places use the same patterns (preflight and the services)', () => {
   const read = (file, name) => {
     const full = path.join(DEPLOY_DIR, 'scripts', file);
@@ -1025,6 +1423,7 @@ test('settings checked in two places use the same patterns (preflight and the se
   const pairs = [
     ['RETENTION_PATTERN', 'backup.sh', 'RETENTION_PATTERN', 'preflight.sh'],
     ['BINLOG_RETENTION_PATTERN', 'db-entrypoint.sh', 'BINLOG_RETENTION_PATTERN', 'preflight.sh'],
+    ['NET_PREFIX_PATTERN', 'metadata-access.sh', 'NET_PREFIX_PATTERN', 'preflight.sh'],
   ];
   for (const [a, fileA, b, fileB] of pairs) {
     const left = read(fileA, a);
@@ -1041,6 +1440,8 @@ test('scripts the containers read from the working tree keep LF line ends', () =
   const files = [
     ...folder('scripts'),
     ...folder('mysql'),
+    // systemd reads the unit on the host; a carriage return would end up in ExecStart.
+    ...folder('systemd'),
     ...fs.readdirSync(DEPLOY_DIR).filter((f) => /^Caddyfile/.test(f)).map((f) => path.join(DEPLOY_DIR, f)),
   ];
   assert.ok(files.length > 1);
@@ -1140,13 +1541,14 @@ test('F-25: Dependabot watches the Dockerfiles and the compose files of deploy/'
 
 // ------------------------------------------------------------------------------ networks
 
-test('networks: only caddy publishes ports (IPv4), db and the jobs sit on internal networks, caddy reaches neither the scheduler nor db', () => {
+test('networks: only caddy publishes a port (443, IPv4), db and the jobs sit on internal networks, caddy reaches neither the scheduler nor db', () => {
   const config = base();
   const services = servicesOf(config);
   const published = services.filter(([, s]) => (s.ports ?? []).length > 0).map(([n]) => n);
   assert.deepEqual(published, ['caddy']);
   for (const p of config.services.caddy.ports) assert.equal(p.host_ip, '0.0.0.0', `port ${p.target} is published for IPv4 only`);
-  assert.deepEqual(config.services.caddy.ports.map((p) => `${p.published}:${p.target}`).sort(), ['443:443', '80:80']);
+  // 443 for Cloudflare, nothing on 80: no ACME and no redirect (deploy/Caddyfile).
+  assert.deepEqual(config.services.caddy.ports.map((p) => `${p.published}:${p.target}/${p.protocol ?? 'tcp'}`), ['443:443/tcp']);
 
   const nets = config.networks;
   for (const [name, n] of Object.entries(nets)) assert.equal(n.enable_ipv6, false, `${name}: IPv6`);
@@ -1188,20 +1590,151 @@ function hop(config, front, back) {
   return { network, ip, subnet: ipam.subnet, range: ipam.ip_range };
 }
 
-test("F-31: the trusted proxy address is caddy's fixed address (mirror)", () => {
+test("F-31: the trusted proxy address is caddy's fixed address (mirror); api's and the scheduler's are the only other fixed addresses", () => {
+  const prefix = ciValues().APP_NET_PREFIX;
   for (const [label, config] of [['production', base()], ['CI', ci()]]) {
     const edge = hop(config, 'caddy', 'api');
     assert.equal(config.services.api.environment.TRUSTED_PROXIES, edge.ip, `${label}: Laravel trusts caddy's address`);
-    assert.ok(edge.subnet && inCidr(edge.ip, edge.subnet), `${label}: ${edge.ip} lies in ${edge.network}'s fixed subnet`);
-    assert.ok(edge.range && !inCidr(edge.ip, edge.range), `${label}: ${edge.ip} lies outside ${edge.network}'s dynamic range: no other container can take it`);
-    assert.notEqual(ipToInt(edge.ip) % 2 ** (32 - Number(edge.subnet.split('/')[1])), 1, `${label}: ${edge.ip} is not the gateway`);
     // The scheduler serves nothing; the image's entrypoint requires the setting, and it is the same.
     assert.equal(config.services.scheduler.environment.TRUSTED_PROXIES, edge.ip, `${label}: the scheduler's TRUSTED_PROXIES`);
-    // Nobody else holds a fixed address: the one that is trusted belongs to caddy alone.
-    const fixed = servicesOf(config).flatMap(([name, s]) => Object.entries(s.networks ?? {}).filter(([, n]) => n?.ipv4_address).map(([net]) => `${name}@${net}`));
-    assert.deepEqual(fixed, [`caddy@${edge.network}`], `${label}: fixed addresses`);
-    console.log(`${label}: caddy ${edge.ip} on ${edge.network} (TRUSTED_PROXIES)`);
+    // The fixed addresses: caddy's, the one Laravel trusts, and the two the host lets reach the
+    // metadata endpoint (scripts/metadata-access.sh). Each comes from APP_NET_PREFIX, lies in its
+    // network's fixed subnet and outside its dynamic range (no other container can take it), and
+    // is not the gateway.
+    const fixed = servicesOf(config).flatMap(([name, s]) => Object.entries(s.networks ?? {})
+      .filter(([, n]) => n?.ipv4_address).map(([net, n]) => ({ at: `${name}@${net}`, net, ip: n.ipv4_address })));
+    assert.deepEqual(fixed.map((f) => `${f.at} ${f.ip}`).sort(), [`api@edge ${prefix}.20`, `caddy@edge ${prefix}.10`, `scheduler@outbound ${prefix}.140`], `${label}: fixed addresses`);
+    assert.equal(edge.ip, `${prefix}.10`, `${label}: the trusted address is caddy's`);
+    for (const f of fixed) {
+      const ipam = config.networks[f.net]?.ipam?.config?.[0] ?? {};
+      assert.ok(ipam.subnet && inCidr(f.ip, ipam.subnet), `${label}: ${f.at} lies in ${f.net}'s fixed subnet`);
+      assert.ok(ipam.ip_range && !inCidr(f.ip, ipam.ip_range), `${label}: ${f.at} lies outside ${f.net}'s dynamic range`);
+      assert.notEqual(ipToInt(f.ip) % 2 ** (32 - Number(ipam.subnet.split('/')[1])), 1, `${label}: ${f.at} is the gateway`);
+    }
+    // The two networks with a way out share the /24 of APP_NET_PREFIX, half each.
+    const ipamOf = (net) => { const c = config.networks[net]?.ipam?.config?.[0] ?? {}; return [c.subnet, c.ip_range]; };
+    assert.deepEqual(ipamOf('edge'), [`${prefix}.0/25`, `${prefix}.64/26`], `${label}: edge`);
+    assert.deepEqual(ipamOf('outbound'), [`${prefix}.128/25`, `${prefix}.192/26`], `${label}: outbound`);
+    console.log(`${label}: caddy ${edge.ip} on ${edge.network} (TRUSTED_PROXIES); ${fixed.filter((f) => !f.at.startsWith('caddy@')).map((f) => `${f.at} ${f.ip}`).join(', ')}`);
   }
+});
+
+// ------------------------------------------------------------------------------ metadata endpoint
+
+/**
+ * A stand-in for iptables (bash): Docker's DOCKER-USER chain as the lines of a file (no file: no
+ * chain), and every call recorded. It knows the three calls deploy/scripts/metadata-access.sh
+ * makes: list the chain (-n -L), check a rule (-C) and insert one (-I <chain> <position>).
+ */
+const IPTABLES_STAND_IN = String.raw`#!/bin/bash
+state=/work/DOCKER-USER
+printf '%s\n' "$*" >> /work/calls
+if [[ "$1" == -n && "$2" == -L ]]; then [[ "$3" == DOCKER-USER && -f "$state" ]]; exit; fi
+case "$1" in
+  -C) [[ "$2" == DOCKER-USER && -f "$state" ]] || exit 2; shift 2; grep -qxF -- "$*" "$state" ;;
+  -I) [[ "$2" == DOCKER-USER && -f "$state" ]] || exit 2; pos=$3; shift 3
+      { head -n $((pos - 1)) "$state"; printf '%s\n' "$*"; tail -n +"$pos" "$state"; } > "$state.new" && mv "$state.new" "$state" ;;
+  *) echo "stand-in iptables: unexpected call: $*" >&2; exit 2 ;;
+esac
+`;
+
+test("metadata endpoint: the host script lets exactly api's and the scheduler's fixed addresses through, one address each, once, and refuses a malformed APP_NET_PREFIX", () => {
+  // The addresses the compose gives api and the scheduler (the only fixed ones besides caddy's).
+  const config = base();
+  const fixedOf = (service) => Object.values(config.services[service].networks ?? {}).map((n) => n?.ipv4_address).filter(Boolean);
+  const expected = [...fixedOf('api'), ...fixedOf('scheduler')].sort();
+  assert.equal(expected.length, 2, `api and the scheduler have one fixed address each: ${expected.join(', ')}`);
+  const prefix = ciValues().APP_NET_PREFIX;
+  // Missing, empty and malformed values of APP_NET_PREFIX: two parts, four parts, a part over
+  // 255, a leading zero, a leading space.
+  const bad = { missing: null, empty: '', 'two-parts': '172.30', 'four-parts': '172.30.99.0', 'over-255': '256.1.1', 'leading-zero': '172.30.099', 'leading-space': ' 172.30.99' };
+  const driver = [
+    'set -u',
+    'mkdir -p /work',
+    "cat > /usr/local/sbin/iptables <<'EOF'",
+    IPTABLES_STAND_IN.trimEnd(),
+    'EOF',
+    'chmod 755 /usr/local/sbin/iptables',
+    // The platform's rules: the drop of all container traffic to the endpoint, then the return.
+    "printf '%s\\n' '-d 169.254.169.254/32 -j DROP' '-j RETURN' > /work/DOCKER-USER",
+    'setenv() { if [ "$1" = __missing__ ]; then echo "DOMAIN=localhost" > /work/env; else printf "APP_NET_PREFIX=%s\\n" "$1" > /work/env; fi; }',
+    "run() { : > /work/calls; out=$(bash /clone/deploy/scripts/metadata-access.sh /work/env 2>&1); code=$?; printf '=== %s exit %s\\n%s\\n--- calls\\n%s\\n--- chain\\n%s\\n' \"$1\" \"$code\" \"$out\" \"$(cat /work/calls)\" \"$(cat /work/DOCKER-USER 2>/dev/null)\"; }",
+    `setenv '${prefix}'; run first`,
+    'run second',
+    ...Object.entries(bad).map(([name, value]) => `setenv '${value ?? '__missing__'}'; run bad-${name}`),
+    `rm /work/DOCKER-USER; setenv '${prefix}'; run no-chain`,
+  ].join('\n');
+  const r = dockerRun(serviceImage('db'), { mounts: [{ src: DEPLOY_DIR, dst: '/clone/deploy' }], entrypoint: 'bash', args: ['-c', driver] });
+  assert.equal(r.status, 0, r.stderr);
+  const runs = Object.fromEntries(r.stdout.split(/^=== /m).slice(1).map((chunk) => {
+    const [head, ...rest] = chunk.split('\n');
+    const [, name, code] = /^(\S+) exit (\d+)$/.exec(head);
+    const [out, calls, chain] = rest.join('\n').split(/^--- (?:calls|chain)$/m).map((s) => s.trim());
+    return [name, { code: Number(code), out, calls: calls ? calls.split('\n') : [], chain: chain ? chain.split('\n') : [] }];
+  }));
+  assert.deepEqual(Object.keys(runs).sort(), ['first', 'second', ...Object.keys(bad).map((n) => `bad-${n}`), 'no-chain'].sort(), r.stdout);
+  const platform = ['-d 169.254.169.254/32 -j DROP', '-j RETURN'];
+  const ruleOf = (ip) => `-s ${ip}/32 -d 169.254.169.254/32 -p tcp --dport 80 -m comment --comment goenn-metadata -j ACCEPT`;
+
+  // The first run adds one rule per address at the top, above the platform's drop.
+  const { first, second } = runs;
+  console.log(`metadata-access: first run ${first.out.replace(/\n/g, '; ')}; second run ${second.out.replace(/\n/g, '; ')}`);
+  assert.equal(first.code, 0, first.out);
+  assert.deepEqual(first.out.split('\n').sort(), expected.map((ip) => `added: ${ip} -> 169.254.169.254:80`).sort());
+  assert.deepEqual(first.chain.slice(-2), platform, 'the platform rules are no longer the last ones');
+  assert.deepEqual(first.chain.slice(0, -2).sort(), expected.map(ruleOf).sort(), 'the rules above the drop');
+  // Single addresses only, on both sides, never a network.
+  const wide = first.chain.filter((l) => /-j ACCEPT/.test(l)).flatMap((l) => [...l.matchAll(/-[sd] (\S+)/g)].map((m) => m[1])).filter((a) => !a.endsWith('/32'));
+  assert.deepEqual(wide, [], 'an ACCEPT rule names a network');
+  // A second run finds them and changes nothing.
+  assert.equal(second.code, 0, second.out);
+  assert.deepEqual(second.out.split('\n').sort(), expected.map((ip) => `found: ${ip} -> 169.254.169.254:80`).sort());
+  assert.deepEqual(second.chain, first.chain, 'the second run changed the chain');
+  assert.deepEqual(second.calls.filter((c) => c.startsWith('-I')), [], 'the second run inserted a rule');
+  // A malformed or missing prefix stops before any call of iptables.
+  for (const name of Object.keys(bad)) {
+    const run = runs[`bad-${name}`];
+    assert.notEqual(run.code, 0, `${name}: the script went on`);
+    assert.deepEqual(run.calls, [], `${name}: iptables was called`);
+    assert.deepEqual(run.chain, first.chain, `${name}: the chain changed`);
+    assert.match(run.out, /APP_NET_PREFIX is missing or not three numbers from 0 to 255/, name);
+  }
+  // Without DOCKER-USER (Docker not running) it lists the chain and stops.
+  assert.notEqual(runs['no-chain'].code, 0, 'no-chain: the script went on');
+  assert.deepEqual(runs['no-chain'].calls, ['-n -L DOCKER-USER'], 'no-chain: more than the one look at the chain');
+  assert.match(runs['no-chain'].out, /DOCKER-USER does not exist/);
+});
+
+test('metadata endpoint: the systemd unit runs the script after Docker starts, at every boot and every Docker restart', () => {
+  const file = path.join(DEPLOY_DIR, 'systemd', 'goenn-metadata-access.service');
+  assert.ok(fs.existsSync(file), 'no deploy/systemd/goenn-metadata-access.service');
+  const unit = {};
+  let section = null;
+  for (const raw of readText(file).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    const head = /^\[(\w+)\]$/.exec(line);
+    if (head) { section = head[1]; unit[section] = {}; continue; }
+    const kv = /^(\w+)=(.*)$/.exec(line);
+    assert.ok(section && kv, `not a line of a unit: ${line}`);
+    (unit[section][kv[1]] ??= []).push(kv[2]);
+  }
+  console.log(`systemd unit: ${Object.keys(unit).join(', ')}`);
+  assert.deepEqual(Object.keys(unit), ['Unit', 'Service', 'Install']);
+  assert.deepEqual(unit.Unit.After, ['docker.service']);
+  assert.deepEqual(unit.Unit.Requires, ['docker.service']);
+  // Stopping or restarting Docker stops or restarts the unit too, and Docker's start pulls it in
+  // again (WantedBy): the script runs after every start of Docker, the boot included.
+  assert.deepEqual(unit.Unit.PartOf, ['docker.service']);
+  assert.deepEqual(unit.Install.WantedBy, ['docker.service']);
+  assert.deepEqual(unit.Service.Type, ['oneshot']);
+  assert.deepEqual(unit.Service.RemainAfterExit, ['yes']);
+  assert.deepEqual(unit.Service.ExecStart, ['/bin/bash @DEPLOY_DIR@/scripts/metadata-access.sh']);
+  assert.ok(fs.existsSync(path.join(DEPLOY_DIR, 'scripts', 'metadata-access.sh')), 'the script the unit runs');
+  // The runbook installs it with the placeholder replaced by the clone's deploy/ folder.
+  const runbook = readText(RUNBOOK).replace(/\r\n/g, '\n');
+  assert.match(runbook, /^ *sed "s\|@DEPLOY_DIR@\|\$\(pwd -P\)\|" systemd\/goenn-metadata-access\.service > \/etc\/systemd\/system\/goenn-metadata-access\.service$/m, 'the runbook does not install the unit');
+  assert.match(runbook, /^ *systemctl enable --now goenn-metadata-access\.service$/m, 'the runbook does not enable the unit');
 });
 
 test('the CI override closes every network, publishes no port and sends every mail to Mailpit', () => {
@@ -1209,6 +1742,7 @@ test('the CI override closes every network, publishes no port and sends every ma
   for (const [name, n] of Object.entries(config.networks)) assert.equal(n.internal, true, `${name} is internal in CI`);
   assert.deepEqual(servicesOf(config).filter(([, s]) => (s.ports ?? []).length > 0).map(([n]) => n), []);
   for (const name of ['api', 'scheduler']) {
+    assert.equal(config.services[name].environment.MAIL_MAILER, 'smtp', name);
     assert.equal(config.services[name].environment.MAIL_HOST, 'mailpit', name);
     assert.equal(config.services[name].depends_on?.mailpit?.condition, 'service_healthy', name);
   }

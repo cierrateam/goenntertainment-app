@@ -1,9 +1,10 @@
 // Helpers for the stack test (deploy/test/stack.test.mjs). CI AND LOCAL TESTS ONLY.
 //
 // `docker compose` against exactly one test project (COMPOSE_PROJECT_NAME), with the minimal
-// environment of lib.mjs plus a fresh APP_KEY, the requests of the probe service
-// (deploy/test/probe.mjs), and small builders for the test's payloads. Nothing here prints a
-// password, a token or a code: answers are shown through redact().
+// environment of lib.mjs plus a fresh APP_KEY and the folder of the run's throw-away certificates,
+// the requests of the probe service (deploy/test/probe.mjs), and small builders for the test's
+// payloads. Nothing here prints a password, a token, a key or a code: answers are shown through
+// redact().
 import { spawnSync } from 'node:child_process';
 import { Buffer } from 'node:buffer';
 import crypto from 'node:crypto';
@@ -51,10 +52,21 @@ export class Stack {
   constructor(settings) {
     this.settings = settings;
     this.project = settings.project;
-    // Compose prefers a variable of the calling environment over the env file: APP_KEY is the
-    // only one passed this way (a fresh key per run), and every compose call carries it, so a
-    // later `up` never sees a different configuration.
+    // Compose prefers a variable of the calling environment over the env file: APP_KEY and
+    // ORIGIN_TLS_DIR (usePki) are the only ones passed this way (a fresh key and fresh
+    // certificates per run), and every compose call carries them, so a later `up` never sees a
+    // different configuration.
     this.env = { ...minimalEnv(), APP_KEY: freshAppKey() };
+  }
+
+  /**
+   * The run's throw-away PKI (lib.mjs throwawayPki): caddy loads the edge's files from its folder
+   * as ORIGIN_TLS_DIR, and the probe presents the client certificate of Authenticated Origin Pulls
+   * and checks the edge's certificate, in Cloudflare's place.
+   */
+  usePki(pki) {
+    this.pki = pki;
+    this.env.ORIGIN_TLS_DIR = pki.edgeDir;
   }
 
   baseArgs(profiles = []) {
@@ -121,11 +133,13 @@ export class Stack {
   }
 
   /**
-   * Sends requests from one probe container (1 or 2: two addresses on the edge network) and
-   * returns { address, results }. A JSON body is parsed into `json` where it is JSON.
+   * Sends requests from one probe container (1 to 3: three addresses on the edge network, like
+   * three of Cloudflare's edge nodes) and returns { address, results }. A JSON body is parsed into
+   * `json` where it is JSON.
    */
   probe(requests, { index = 1 } = {}) {
-    const r = this.exec('probe', ['node', '/checks/probe.mjs'], { index, input: JSON.stringify({ requests }), profiles: ['test'] });
+    const job = JSON.stringify({ tls: this.pki?.client, requests });
+    const r = this.exec('probe', ['node', '/checks/probe.mjs'], { index, input: job, profiles: ['test'] });
     if (r.status !== 0) throw new Error(`probe ${index} failed (exit ${r.status}): ${r.stderr.trim()}`);
     const out = JSON.parse(r.stdout.trim().split('\n').at(-1));
     for (const res of out.results) {
@@ -147,7 +161,7 @@ export class Stack {
 }
 
 /** A request for the probe: JSON in and out, with an optional bearer token. */
-export function apiRequest(method, urlPath, { token, json, headers = {}, body, bodyBase64, scheme } = {}) {
+export function apiRequest(method, urlPath, { token, json, headers = {}, body, bodyBase64 } = {}) {
   const h = { Accept: 'application/json', ...headers };
   if (token) h.Authorization = `Bearer ${token}`;
   let text = body;
@@ -155,7 +169,7 @@ export function apiRequest(method, urlPath, { token, json, headers = {}, body, b
     h['Content-Type'] = 'application/json';
     text = JSON.stringify(json);
   }
-  return { method, path: urlPath, headers: h, body: text, bodyBase64, scheme };
+  return { method, path: urlPath, headers: h, body: text, bodyBase64 };
 }
 
 /**

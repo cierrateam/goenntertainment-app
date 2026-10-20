@@ -52,7 +52,8 @@ The screens live in [`src/app`](src/app) and use [file-based routing](https://do
 ### Mail in development
 
 Laravel (`api/`) sends 2FA codes, password reset codes, the codes that confirm a new e-mail
-address or a first password, and other mail over SMTP. In
+address or a first password, and other mail. A server sends it through Microsoft Graph or over
+SMTP ([`deploy/README.md`](deploy/README.md#settings), `MAIL_MAILER`). In
 development a local mail catcher, [Mailpit](https://github.com/axllent/mailpit),
 receives every mail, so no code is ever written to a log:
 
@@ -97,8 +98,8 @@ CI together.
 | Values written in several places (CI and Dockerfile versions, the internal secret rules, the request body limits) | | `node scripts/ci/check-mirrors.mjs` | |
 | Workflow lint | | actionlint, see [`.github/actionlint/Dockerfile`](.github/actionlint/Dockerfile) | Docker |
 | Dependency audit | | `node scripts/ci/audit.mjs npm .`, `… npm server`, `… composer api` | network (registry); blocking (advisories fixed or listed in `.github/audit-allowlist.json`) |
-| Deploy static checks | `deploy/test/*.test.mjs` except `stack.test.mjs` | `npm run test:deploy` (the compose files as Compose renders them with [`deploy/ci.env`](deploy/ci.env), the Caddyfile as Caddy adapts it, the scripts and the Dockerfiles; starts no stack) | Docker: the CLI and the pinned `mysql` and `caddy` images |
-| Deploy stack test | `deploy/test/stack.test.mjs` | `COMPOSE_PROJECT_NAME=<a name of its own> npm run test:deploy:stack` (PowerShell: set `$env:COMPOSE_PROJECT_NAME` first). It builds the images, starts the whole stack with `deploy/docker-compose.ci.yml` and `deploy/ci.env` on internal networks, checks it through Caddy from a probe container, and removes it with its volumes and built images | Docker with Compose >= 2.24.4; registry access for the image builds; the subnet of `APP_NET_PREFIX` (`deploy/ci.env`) free on this host |
+| Deploy static checks | `deploy/test/*.test.mjs` except `stack.test.mjs` | `npm run test:deploy` (the compose files as Compose renders them with [`deploy/ci.env`](deploy/ci.env), the Caddyfile as Caddy adapts it and validates it with throw-away certificates from `deploy/test/throwaway-pki.sh`, the scripts and the Dockerfiles; starts no stack) | Docker: the CLI and the pinned `mysql` and `caddy` images |
+| Deploy stack test | `deploy/test/stack.test.mjs` | `COMPOSE_PROJECT_NAME=<a name of its own> npm run test:deploy:stack` (PowerShell: set `$env:COMPOSE_PROJECT_NAME` first). It builds the images, starts the whole stack with `deploy/docker-compose.ci.yml` and `deploy/ci.env` on internal networks, checks it through Caddy from a probe container that plays Cloudflare with throw-away certificates made for the run, and removes it with its volumes and built images | Docker with Compose >= 2.24.4; registry access for the image builds; the subnet of `APP_NET_PREFIX` (`deploy/ci.env`) free on this host |
 
 One-time setup per clone:
 
