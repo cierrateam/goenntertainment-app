@@ -311,7 +311,7 @@ services:
     logging: *logging
 
   caddy:
-    image: caddy:2-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    image: caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
     restart: unless-stopped
     depends_on:
       api:
@@ -359,7 +359,7 @@ services:
   # Caddy's file server follows symbolic links: one planted in the uploads volume resolves in here,
   # where there is nothing secret to read (no settings, no keys, empty temporary /data and /config).
   media:
-    image: caddy:2-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
+    image: caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
     restart: unless-stopped
     user: '65534:65534'
     read_only: true
