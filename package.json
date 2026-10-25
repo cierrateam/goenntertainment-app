@@ -45,7 +45,7 @@
     "react-native-worklets": "0.10.1"
   },
   "devDependencies": {
-    "@types/node": "^22.20.4",
+    "@types/node": "^26.6.4",
     "@types/qrcode": "^1.5.6",
     "@types/react": "~19.2.4",
     "eslint": "^9.0.0",
