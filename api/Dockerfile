@@ -34,7 +34,7 @@ FROM mlocati/php-extension-installer:2@sha256:1afade3e29cfc97362cf5885e5ac333bf2
 FROM composer:2@sha256:af98f42dfff7c68ba8d53c2164fd9fde1087b7d449514baa38c418b1f6bc4bac AS composer-bin
 
 # ================================================================ base
-FROM php:8.4-apache@sha256:75325cceea4f9a8200f4e9e146e8155ec1b6466b2957b87accf0286b94547cbd AS base
+FROM php:8.5-apache@sha256:974e3a920309308e1690ed607e6cc3061d6906f90cc8d30fe519daa48bccf101 AS base
 
 # ---------------------------------------------------------------- PHP-Erweiterungen
 # pdo_mysql  Datenbank
