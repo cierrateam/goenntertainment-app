@@ -8,7 +8,7 @@
     "@expo/ui": "~57.0.20",
     "@react-native-community/datetimepicker": "9.1.0",
     "@react-native-masked-view/masked-view": "0.3.2",
-    "expo": "~57.0.0",
+    "expo": "~58.0.22",
     "expo-asset": "~57.0.18",
     "expo-audio": "~57.0.5",
     "expo-blur": "~57.0.3",
