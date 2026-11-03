@@ -64,3 +64,8 @@ example
 # generated native folders
 /ios
 /android
+
+# Local files that belong neither in the repository nor in the EAS build upload, which leaves
+# out what this file ignores: the reel videos (several GB) and a personal document.
+/marketing/
+/Praktikumsbericht.docx
