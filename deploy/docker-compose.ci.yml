@@ -3,9 +3,10 @@
 #
 # What it changes, and why:
 #   - every network is internal: the test stack reaches nothing outside this machine, not even
-#     the internet (no ACME: DOMAIN=localhost makes Caddy use its internal CA);
+#     the internet (the edge loads the throw-away certificates the stack test makes for each run,
+#     deploy/test/throwaway-pki.sh, through ORIGIN_TLS_DIR);
 #   - caddy publishes no host port: tests reach it over the edge network, from the `probe`
-#     service below;
+#     service below, which plays Cloudflare;
 #   - Mailpit catches every mail of api and the scheduler (no code ever lands in a log);
 #   - the backups go to a throw-away volume instead of BACKUP_DIR.
 # The two services this file adds (mailpit, probe) rotate their logs like every other container.
@@ -63,9 +64,10 @@ services:
         max-size: ${LOG_MAX_SIZE:?LOG_MAX_SIZE is missing in the env file (see deploy/ci.env)}
         max-file: ${LOG_MAX_FILES:?LOG_MAX_FILES is missing in the env file (see deploy/ci.env)}
 
-  # The visitor's side of the stack test (deploy/test/probe.mjs): it sits on the edge network next
-  # to caddy and reaches caddy only, so its requests arrive at caddy the way a visitor's do, from
-  # the probe's own address. Only with `--profile test`. Built from server/Dockerfile (the Node
+  # Cloudflare's side of the stack test (deploy/test/probe.mjs): it sits on the edge network next
+  # to caddy and reaches caddy only, presents the client certificate of Authenticated Origin Pulls
+  # and sends the visitor's address in CF-Connecting-IP, the way Cloudflare's requests arrive at
+  # caddy. Only with `--profile test`. Built from server/Dockerfile (the Node
   # image of the repository's server/, which the production stack no longer runs), so the Node
   # base image is pinned in that one file and Dependabot's update of it covers the probe as
   # well; only the entrypoint differs.

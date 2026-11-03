@@ -2,9 +2,11 @@
 
 namespace App\Providers;
 
+use App\Mail\GraphTransport;
 use App\Support\RateLimitKeys;
 use App\Support\RateLimitRules;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\ServiceProvider;
 use Laravel\Sanctum\PersonalAccessToken;
@@ -32,6 +34,9 @@ class AppServiceProvider extends ServiceProvider
     public function boot(): void
     {
         $this->configureRateLimiting();
+
+        // The `graph` mailer (config/mail.php): Microsoft Graph as the server's managed identity.
+        Mail::extend('graph', static fn (array $config) => GraphTransport::fromConfig($config, config('mail.from.address')));
 
         /*
          * A token is valid only with an expiry date that has not passed (F-20). Sanctum alone

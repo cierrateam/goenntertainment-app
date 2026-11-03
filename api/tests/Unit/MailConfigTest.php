@@ -38,6 +38,56 @@ class MailConfigTest extends TestCase
         }
     }
 
+    /**
+     * config/mail.php with these variables in the environment (null: unset), each restored
+     * afterwards.
+     *
+     * @param  array<string, string|null>  $variables
+     */
+    private static function mailConfigWith(array $variables): array
+    {
+        $saved = [];
+        foreach ($variables as $name => $value) {
+            $saved[$name] = [$_ENV[$name] ?? null, $_SERVER[$name] ?? null, getenv($name)];
+            unset($_ENV[$name], $_SERVER[$name]);
+            putenv($name);
+            if ($value !== null) {
+                $_ENV[$name] = $_SERVER[$name] = $value;
+                putenv("{$name}={$value}");
+            }
+        }
+        try {
+            return require self::apiPath('config/mail.php');
+        } finally {
+            foreach ($saved as $name => [$env, $server, $process]) {
+                unset($_ENV[$name], $_SERVER[$name]);
+                putenv($name);
+                if ($env !== null) {
+                    $_ENV[$name] = $env;
+                }
+                if ($server !== null) {
+                    $_SERVER[$name] = $server;
+                }
+                if ($process !== false) {
+                    putenv("{$name}={$process}");
+                }
+            }
+        }
+    }
+
+    /**
+     * The graph mailer (App\Mail\GraphTransport) signs in as the server's managed identity: its
+     * client ID is the one setting, without a default, and there is no secret to configure.
+     */
+    public function test_the_graph_mailer_reads_only_the_managed_identity_without_a_default(): void
+    {
+        $unset = self::mailConfigWith(['MAIL_GRAPH_CLIENT_ID' => null]);
+        $this->assertSame(['transport' => 'graph', 'client_id' => null], $unset['mailers']['graph']);
+
+        $set = self::mailConfigWith(['MAIL_GRAPH_CLIENT_ID' => '00000000-0000-4000-8000-00000000000b']);
+        $this->assertSame(['transport' => 'graph', 'client_id' => '00000000-0000-4000-8000-00000000000b'], $set['mailers']['graph']);
+    }
+
     public function test_default_mailer_is_smtp_when_nothing_is_configured(): void
     {
         $this->assertSame('smtp', self::mailConfigWithoutMailer()['default']);

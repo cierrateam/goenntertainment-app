@@ -25,6 +25,19 @@ missing=""
 case "$TRUSTED_PROXIES" in
   ''|'*'|'**') missing="$missing TRUSTED_PROXIES(the reverse proxy's address, never *)" ;;
 esac
+# How mail goes out (deploy/README.md, Settings): Microsoft Graph or SMTP, and every setting the
+# chosen way needs; nothing falls back to another way. Never the log mailer, or any other: it
+# would write every code into the container log (api/app/Support/CodeMail.php).
+case "$MAIL_MAILER" in
+  graph)
+    [ -n "$MAIL_GRAPH_CLIENT_ID" ] || missing="$missing MAIL_GRAPH_CLIENT_ID(the managed identity's client ID, for MAIL_MAILER=graph)"
+    ;;
+  smtp)
+    [ -n "$MAIL_HOST" ] || missing="$missing MAIL_HOST(the SMTP host, for MAIL_MAILER=smtp)"
+    ;;
+  *) missing="$missing MAIL_MAILER(graph or smtp)" ;;
+esac
+[ -n "$MAIL_FROM_ADDRESS" ] || missing="$missing MAIL_FROM_ADDRESS(the sender mailbox)"
 if [ -n "$missing" ]; then
   echo "ERROR: required settings missing or invalid:$missing (see deploy/.env.example)" >&2
   exit 1

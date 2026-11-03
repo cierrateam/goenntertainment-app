@@ -15,7 +15,9 @@ return [
     */
 
     // Not 'log': mails carry 2FA and reset codes, and a code must never land in a log. Without a
-    // setting, mail goes to SMTP (in development the local catcher, see api/.env.example).
+    // setting, mail goes to SMTP (in development the local catcher, see api/.env.example). On a
+    // server MAIL_MAILER is required, `graph` or `smtp` (deploy/docker-compose.yml; the image's
+    // entrypoint refuses anything else).
     'default' => env('MAIL_MAILER', 'smtp'),
 
     /*
@@ -53,6 +55,15 @@ return [
             // codes. The server sets it (deploy/docker-compose.yml); locally and in CI, Mailpit
             // speaks plain SMTP, hence off unless set.
             'require_tls' => env('MAIL_REQUIRE_TLS', false),
+        ],
+
+        // Microsoft Graph as the server's user-assigned managed identity (App\Mail\GraphTransport,
+        // registered in AppServiceProvider): its client ID, a GUID and no secret; the token comes
+        // from the server's metadata endpoint. The sender is the mailbox in MAIL_FROM_ADDRESS.
+        // No default: a server sets it (deploy/README.md, Mail through Microsoft Graph).
+        'graph' => [
+            'transport' => 'graph',
+            'client_id' => env('MAIL_GRAPH_CLIENT_ID'),
         ],
 
         'ses' => [

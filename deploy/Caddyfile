@@ -1,6 +1,43 @@
-# Caddy holt und erneuert das HTTPS-Zertifikat von Let's Encrypt vollautomatisch,
-# sobald die Domain auf diesen Server zeigt. Kein certbot, kein Cronjob.
-#
+# The public edge, behind Cloudflare (deploy/README.md, Cloudflare and the load balancer).
+# Cloudflare reaches it through the platform's load balancer on 443 only: TLS with a Cloudflare
+# Origin CA certificate (SSL mode Full (strict)), and Authenticated Origin Pulls, so a handshake
+# completes only with the client certificate Cloudflare presents. Every file comes from
+# ORIGIN_TLS_DIR on the host (deploy/docker-compose.yml, caddy): no ACME, nothing on port 80.
+{
+	# No certificate management and no HTTP->HTTPS redirect: the certificate is a file, and
+	# nothing listens on port 80.
+	auto_https off
+	# Cloudflare does not need a stapled OCSP answer: the edge makes no outbound calls at all.
+	ocsp_stapling off
+	servers {
+		# The visitor's address comes from Cloudflare's CF-Connecting-IP header, whatever the TCP
+		# peer (the platform's firewall holds the only copy of Cloudflare's address ranges).
+		# Trusting EVERY source is safe only because every TLS connection policy below requires
+		# the client certificate of the Authenticated Origin Pulls CA (the origin_tls snippet,
+		# imported by both sites): nobody but Cloudflare completes a handshake, so nobody else can
+		# send this header. These two lines and client_auth stand or fall together.
+		trusted_proxies static 0.0.0.0/0 ::/0
+		client_ip_headers CF-Connecting-IP
+		# The Host header must match the TLS server name. Caddy turns this on by itself when
+		# client certificates are required; stated here so it never depends on that.
+		strict_sni_host on
+		# TCP only, like the one published port: no HTTP/3 listener on UDP 443.
+		protocols h1 h2
+	}
+}
+
+# The origin certificate and its key, and the CA that signed Cloudflare's client certificate
+# (deploy/README.md, Origin certificate and Authenticated Origin Pulls). A handshake without a
+# client certificate signed by that CA fails. There is no setting that turns this off.
+(origin_tls) {
+	tls /etc/caddy/origin/origin-cert.pem /etc/caddy/origin/origin-key.pem {
+		client_auth {
+			mode require_and_verify
+			trust_pool file /etc/caddy/origin/origin-pull-ca.pem
+		}
+	}
+}
+
 # Security headers on every answer (F-30), also on Caddy's own errors (handle_errors below).
 # `-Server` makes the block apply when the answer is written, so it also overwrites what
 # Laravel sent. `?Content-Security-Policy` only sets a default: the stricter policy of the uploads
@@ -20,13 +57,15 @@
 	}
 }
 
-{$DOMAIN} {
+https://{$DOMAIN} {
+	import origin_tls
 	import security_headers
 
-	# Request body limits. Multipart (image uploads): etwas über dem 5-MB-Limit für Bilder
-	# (api/app/Support/Uploads.php) und unter post_max_size von PHP (api/docker/php.ini). So
-	# lehnt das Backend zu große Bilder mit seiner eigenen, in der App lesbaren Fehlermeldung ab,
-	# statt dass Caddy die Verbindung vorher mit einem nackten 413 kappt.
+	# Request body limits. Multipart (image uploads): a little over the 5 MB image limit
+	# (api/app/Support/Uploads.php) and under PHP's post_max_size (api/docker/php.ini), so the
+	# backend refuses an image that is too large with its own message, which the app can show,
+	# instead of Caddy cutting the connection with a bare 413. Both stay far below Cloudflare's
+	# request-body limit.
 	# Every other body: the largest limit Laravel applies to a body that is not an upload (the
 	# webhook's JSON, LimitRequestBody::WEBHOOK_JSON_LIMIT_KB); it keeps its own, smaller limits
 	# per type (deploy/test/static.test.mjs compares the numbers).
@@ -44,15 +83,22 @@
 	# Uploads.php: PUBLIC_FOLDERS, STORED_NAME); everything else under /storage is a 404 from
 	# Caddy, so no other file there is ever served or handed to Laravel. Evidence images live in
 	# the private-media volume, which no file server mounts; Laravel hands them to admins only,
-	# through a checked route (GET /api/admin/evidence-files/{file}).
+	# through a checked route (GET /api/admin/evidence-files/{file}), with Cache-Control
+	# `private, no-store` so that no cache keeps them.
 	# The files themselves come from the `media` service (deploy/Caddyfile.media), not from this
-	# container: Caddy follows symbolic links, and this container holds the certificate and
-	# account keys (caddy-data), so it mounts no volume anyone else writes to.
+	# container: Caddy follows symbolic links, and this container holds the origin key
+	# (/etc/caddy/origin), so it mounts no volume anyone else writes to.
 	@upload path_regexp upload ^/storage/(avatars|partners|offers)/[0-9a-f]{40}\.(jpg|png|webp)$
 	handle @upload {
-		# The browser shows the image and runs nothing in it. Set when the answer is written, so
-		# this policy is the one sent, whatever the file server answers.
-		header >Content-Security-Policy "default-src 'none'; sandbox"
+		# Both set when the answer is written, so they are the ones sent, whatever the file server
+		# answers. The browser shows the image and runs nothing in it. Cloudflare caches .jpg,
+		# .png and .webp by their extension, 120 minutes when the origin says nothing: five
+		# minutes here, so a removed image leaves Cloudflare's cache within that time. Caddy's own
+		# error answers (a 502 while media is down) go through handle_errors and get neither.
+		header {
+			>Content-Security-Policy "default-src 'none'; sandbox"
+			>Cache-Control "public, max-age=300"
+		}
 		reverse_proxy media:8080
 	}
 	@storage path /storage /storage/*
@@ -64,14 +110,17 @@
 		# Everything else goes to Laravel (container `api`): the API and the pages behind sticker
 		# and invite links (/c/..., /g/...). Laravel answers every path itself.
 		reverse_proxy api:8080 {
-			# Sagt dem Backend, dass außen HTTPS anliegt. Laravel vertraut dem
-			# (trustProxies in api/bootstrap/app.php) und baut Bild-Adressen mit https.
+			# Every forwarding header Laravel trusts from this edge (api/bootstrap/app.php:
+			# X-Forwarded-For, -Host, -Proto; TRUSTED_PROXIES is caddy's address only, F-31) is SET
+			# here, never passed on. With every source trusted (servers, above), Caddy would
+			# otherwise forward the values a client sent: a forged host or scheme, or a chain of
+			# addresses ending in Cloudflare's. Caddy's adapter calls the Proto and Host lines
+			# "unnecessary"; that holds only without trusted_proxies.
+			# The client address: the one Caddy took from CF-Connecting-IP; the rate limits count it.
+			header_up X-Forwarded-For {client_ip}
+			# HTTPS outside: Laravel builds https addresses (image URLs) from it.
 			header_up X-Forwarded-Proto {scheme}
-			# The client address: always the TCP peer Caddy sees, never a value the client sent
-			# (overwrite, not append). Laravel trusts this header from Caddy only (TRUSTED_PROXIES)
-			# and its rate limits count this address. Caddy's default does the same today; this
-			# line keeps it so whatever the default becomes.
-			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Host {host}
 		}
 	}
 
@@ -79,7 +128,8 @@
 
 	# Access log to the container log (docker compose logs caddy), rotated with every other
 	# container log by the compose's logging settings (LOG_MAX_SIZE, LOG_MAX_FILES). It holds the
-	# client address, method and full URI; Caddy leaves out the Authorization and Cookie headers.
+	# visitor's address (client_ip, from CF-Connecting-IP) next to Cloudflare's (remote_ip), the
+	# method and the full URI; Caddy leaves out the Authorization and Cookie headers.
 	log {
 		output stdout
 		format json
@@ -91,4 +141,13 @@
 		import security_headers
 		respond "{err.status_code} {err.status_text}" {err.status_code}
 	}
+}
+
+# Every other server name, and a handshake without one: the same client-certificate rule, then
+# the connection is closed. Without this site, Caddy adds a TLS policy WITHOUT client
+# authentication for names other than {$DOMAIN}, and an Origin CA certificate usually also
+# covers *.<domain>: a handshake under such a name would complete without a client certificate.
+https:// {
+	import origin_tls
+	abort
 }

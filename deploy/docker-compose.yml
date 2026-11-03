@@ -1,23 +1,26 @@
 # GÖ4Fun auf einem Server – alle Teile als Container.
 #
-#   Internet ─► caddy (HTTPS, Port 80/443)
-#                 ├─► media (public uploads as plain files, read-only; holds no secrets)
-#                 └─► api   (Laravel, api/)       die ganze API, die Uploads, das Schema
-#                 scheduler (dasselbe Abbild)     Laravels Zeitplan: Abos, Credits, Aufräumen
-#                 db  (MySQL)  ◄── api und scheduler; the nightly backup (backup)
+#   Cloudflare ─► caddy (HTTPS on port 443 only, through the platform's load balancer)
+#                   ├─► media (public uploads as plain files, read-only; holds no secrets)
+#                   └─► api   (Laravel, api/)       the whole API, the uploads, the schema
+#                   scheduler (the same image)      Laravel's schedule: subscriptions, credits, clean-up
+#                   db  (MySQL)  ◄── api and the scheduler; the nightly backup (backup)
 #
 # Das Node-Backend (server/) läuft seit dem Marktplatz-Umbau nicht mehr mit: Laravel beantwortet
 # alle Routen selbst und verwaltet auch das Schema (`php artisan migrate` beim Start des
 # api-Containers, api/docker/entrypoint.sh). Von außen erreichbar ist nur Caddy.
 #
 # Networks (who can reach whom; the bottom of this file has the details):
-#   edge      caddy <-> api. caddy's ports, certificates and api's mail go through here.
+#   edge      caddy <-> api. caddy's published port and api's mail go through here; caddy itself
+#             calls out to nothing.
 #   media     caddy <-> media. Internal: the file server has no way out and reaches nothing else.
 #   app       api and scheduler -> db. Internal: no way out.
 #   data      db <-> backup, admin-gate, seed. Internal.
 #   outbound  the scheduler alone: its way out to the mail provider (credit reminders).
 # caddy reaches neither the scheduler nor db, db has no way out, and caddy and api share exactly
-# one network, so api sees caddy at one fixed address (F-31).
+# one network, so api sees caddy at one fixed address (F-31). api and the scheduler have fixed
+# addresses as well: the host lets these two, and no other container, reach the metadata endpoint
+# for the graph mailer's token (scripts/metadata-access.sh).
 #
 # Every setting without a default is required: docker compose refuses to start until deploy/.env
 # sets it (deploy/.env.example lists them, with who decides each). Before the first start and
@@ -180,18 +183,24 @@ services:
       # echtes Geld. Echte Zahlungen kommen erst mit einem Zahlungsanbieter. Which one a server
       # runs is an operator decision without a default; the scheduler reads the same setting.
       PAYMENTS_MODE: ${PAYMENTS_MODE:?PAYMENTS_MODE is missing in deploy/.env (off or test, an operator decision; see deploy/.env.example)}
-      # Mail-Versand für 2FA-Codes und „Passwort vergessen". Always SMTP: the log mailer would
-      # write every code into the container log. Which provider and which sender address are
-      # operator decisions, so both are required.
-      MAIL_MAILER: smtp
-      MAIL_HOST: ${MAIL_HOST:?MAIL_HOST is missing in deploy/.env (the mail provider, an operator decision; see deploy/.env.example)}
+      # Mail: two-factor, password-reset and e-mail-change codes, and the credit reminders. How it
+      # goes out is an operator decision without a default: `graph` (Microsoft Graph as the
+      # server's managed identity, api/app/Mail/GraphTransport.php) or `smtp`. Never the log
+      # mailer: it would write every code into the container log. Every line below must be in
+      # deploy/.env, empty where the chosen way does not use it; the image's entrypoint stops the
+      # start when one the chosen way needs is empty (api/docker/entrypoint.sh).
+      MAIL_MAILER: ${MAIL_MAILER:?MAIL_MAILER is missing in deploy/.env (graph or smtp, an operator decision; see deploy/.env.example)}
+      # Microsoft Graph: the client ID of the server's user-assigned managed identity (no secret).
+      MAIL_GRAPH_CLIENT_ID: ${MAIL_GRAPH_CLIENT_ID?MAIL_GRAPH_CLIENT_ID is missing in deploy/.env (empty with MAIL_MAILER=smtp; see deploy/.env.example)}
+      # SMTP: the provider. MAIL_USERNAME and MAIL_PASSWORD may be empty for a relay without login.
+      MAIL_HOST: ${MAIL_HOST?MAIL_HOST is missing in deploy/.env (empty with MAIL_MAILER=graph; see deploy/.env.example)}
       MAIL_PORT: ${MAIL_PORT:-587}
-      # Must be in deploy/.env; may be empty for a relay that takes mail without a login.
       MAIL_USERNAME: ${MAIL_USERNAME?MAIL_USERNAME is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
       MAIL_PASSWORD: ${MAIL_PASSWORD?MAIL_PASSWORD is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
       MAIL_SCHEME: ${MAIL_SCHEME:-}
       # Never in clear text: STARTTLS (or smtps) or no mail at all (api/config/mail.php).
       MAIL_REQUIRE_TLS: 'true'
+      # The sender of every mail; with graph, the mailbox the identity may send as.
       MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:?MAIL_FROM_ADDRESS is missing in deploy/.env (the sender mailbox, an operator decision; see deploy/.env.example)}
       MAIL_FROM_NAME: GÖ4Fun
       # Nur dieser Container spielt Schema-Änderungen ein, nicht auch noch der scheduler – zwei
@@ -217,7 +226,12 @@ services:
       timeout: 5s
       retries: 5
       start_period: 60s
-    networks: [edge, app]
+    networks:
+      edge:
+        # Fixed: the host lets this address and the scheduler's, and no other container, reach the
+        # metadata endpoint for the graph mailer's token (scripts/metadata-access.sh).
+        ipv4_address: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.20
+      app: {}
     security_opt: ['no-new-privileges:true']
     cap_drop: [ALL]
     logging: *logging
@@ -263,8 +277,10 @@ services:
       QUEUE_CONNECTION: sync
       # The same as api's: club renewals charge through it.
       PAYMENTS_MODE: ${PAYMENTS_MODE:?PAYMENTS_MODE is missing in deploy/.env (off or test, an operator decision; see deploy/.env.example)}
-      MAIL_MAILER: smtp
-      MAIL_HOST: ${MAIL_HOST:?MAIL_HOST is missing in deploy/.env (the mail provider, an operator decision; see deploy/.env.example)}
+      # The same mail settings as api's (the credit reminders).
+      MAIL_MAILER: ${MAIL_MAILER:?MAIL_MAILER is missing in deploy/.env (graph or smtp, an operator decision; see deploy/.env.example)}
+      MAIL_GRAPH_CLIENT_ID: ${MAIL_GRAPH_CLIENT_ID?MAIL_GRAPH_CLIENT_ID is missing in deploy/.env (empty with MAIL_MAILER=smtp; see deploy/.env.example)}
+      MAIL_HOST: ${MAIL_HOST?MAIL_HOST is missing in deploy/.env (empty with MAIL_MAILER=graph; see deploy/.env.example)}
       MAIL_PORT: ${MAIL_PORT:-587}
       MAIL_USERNAME: ${MAIL_USERNAME?MAIL_USERNAME is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
       MAIL_PASSWORD: ${MAIL_PASSWORD?MAIL_PASSWORD is missing in deploy/.env (empty is allowed for a relay without login; see deploy/.env.example)}
@@ -285,7 +301,11 @@ services:
     # The image checks Apache, which does not run in this container.
     healthcheck:
       disable: true
-    networks: [app, outbound]
+    networks:
+      app: {}
+      outbound:
+        # Fixed, like api's: the host lets it reach the metadata endpoint (scripts/metadata-access.sh).
+        ipv4_address: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.140
     security_opt: ['no-new-privileges:true']
     cap_drop: [ALL]
     logging: *logging
@@ -300,11 +320,9 @@ services:
       admin-gate:
         condition: service_completed_successfully
     ports:
-      # IPv4 only. The networks have no IPv6, so Docker would relay an IPv6 client with the
-      # network's gateway as its address: every IPv6 client would share one address in the
-      # rate limits. Until IPv6 is set up end to end the domain gets no AAAA record
-      # (deploy/.env.example, DOMAIN).
-      - '0.0.0.0:80:80'
+      # 443 only, IPv4 only: Cloudflare reaches the server through the platform's load balancer,
+      # and nothing listens on port 80 (no ACME, no redirect). The networks have no IPv6; IPv6
+      # visitors reach Cloudflare, and their address arrives in CF-Connecting-IP (deploy/Caddyfile).
       - '0.0.0.0:443:443'
     environment:
       DOMAIN: ${DOMAIN:?DOMAIN is missing in deploy/.env (an operator decision; see deploy/.env.example)}
@@ -315,15 +333,24 @@ services:
       media: {}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      # Hier liegen die Let's-Encrypt-Zertifikate. Ohne dieses Volume holt Caddy
-      # bei jedem Neustart neue und läuft irgendwann ins Rate-Limit.
+      # The origin certificate, its key and the origin-pull CA, from a folder on the host,
+      # read-only (deploy/README.md, Origin certificate and Authenticated Origin Pulls). The long
+      # syntax with create_host_path: false: a missing folder stops the start instead of becoming
+      # an empty one.
+      - type: bind
+        source: ${ORIGIN_TLS_DIR:?ORIGIN_TLS_DIR is missing in deploy/.env (the folder with the origin certificate files; see deploy/.env.example)}
+        target: /etc/caddy/origin
+        read_only: true
+        bind:
+          create_host_path: false
+      # Caddy's own state; no certificate lives here (the certificate is a file, there is no ACME).
       - caddy-data:/data
       - caddy-config:/config
       # No uploads volume: caddy follows symbolic links, so a link planted there would hand out
-      # the keys in caddy-data. The media service serves the uploads (deploy/Caddyfile.media).
+      # the origin key. The media service serves the uploads (deploy/Caddyfile.media).
     security_opt: ['no-new-privileges:true']
     cap_drop: [ALL]
-    # Runs as root in its image and binds 80 and 443.
+    # Runs as root in its image (it reads the root-owned key as its owner) and binds 443.
     cap_add: [NET_BIND_SERVICE]
     logging: *logging
 
@@ -372,7 +399,8 @@ services:
     logging: *logging
 
   # Nightly backup of the database and the uploads, with pruning (F-17, scripts/backup.sh):
-  # every day at 02:30 UTC and once at start, into BACKUP_DIR on the host.
+  # every day at 02:30 UTC and once at start, into BACKUP_DIR on the host. Only the nightly runs
+  # delete old sets; the run at start deletes nothing.
   backup:
     image: mysql:8.4@sha256:6ea90827b1100f8f2ae306a539f86d2c264a26ed435a2a9f75551dd5c3aeb242
     restart: unless-stopped
@@ -464,11 +492,13 @@ volumes:
   private-media:
 
 # APP_NET_PREFIX (the first three parts of a free private /24 on this host, see
-# deploy/.env.example) holds the edge network, with a fixed proxy address (F-31):
-#   edge  <prefix>.0/25    caddy at .10; Laravel trusts forwarding headers from it only
-#                          (TRUSTED_PROXIES). Other containers get .64-.127.
-# So no other container can take the fixed address. The other networks get their addresses from
-# Docker. No network has IPv6 (see caddy's ports).
+# deploy/.env.example) holds the two networks with a way out, with fixed addresses:
+#   edge      <prefix>.0/25    caddy at .10: Laravel trusts forwarding headers from it only
+#                              (TRUSTED_PROXIES, F-31); api at .20. Other containers get .64-.127.
+#   outbound  <prefix>.128/25  the scheduler at .140. Other containers get .192-.255.
+# So no other container can take a fixed address. The host lets api's and the scheduler's
+# addresses, and no other, reach the metadata endpoint (scripts/metadata-access.sh). The internal
+# networks get their addresses from Docker. No network has IPv6 (see caddy's ports).
 networks:
   edge:
     enable_ipv6: false
@@ -487,3 +517,7 @@ networks:
     enable_ipv6: false
   outbound:
     enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.128/25
+          ip_range: ${APP_NET_PREFIX:?APP_NET_PREFIX is missing in deploy/.env (see deploy/.env.example)}.192/26

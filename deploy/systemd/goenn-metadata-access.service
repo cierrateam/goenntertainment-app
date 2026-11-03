@@ -1,0 +1,17 @@
+# Lets api and the scheduler reach the metadata endpoint (169.254.169.254) for the graph mailer's
+# token: runs deploy/scripts/metadata-access.sh once Docker runs, at every boot and after every
+# Docker restart. Installed by the runbook's first start (deploy/README.md, First start), with
+# @DEPLOY_DIR@ replaced by the clone's deploy/ folder.
+[Unit]
+Description=goenn: let api and the scheduler reach the metadata endpoint
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash @DEPLOY_DIR@/scripts/metadata-access.sh
+
+[Install]
+WantedBy=docker.service

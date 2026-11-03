@@ -6,6 +6,7 @@ deploy/Caddyfile text eol=lf
 deploy/Caddyfile.media text eol=lf
 deploy/scripts/** text eol=lf
 deploy/mysql/** text eol=lf
+deploy/systemd/** text eol=lf
 deploy/test/** text eol=lf
 deploy/ci.env text eol=lf
 deploy/.env.example text eol=lf
