@@ -9,6 +9,7 @@ import { PlanBadge } from '@/components/plan-badge';
 import { StampCard } from '@/components/stamp-card';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
+import { Entrance } from '@/components/ui/entrance';
 import { Icon } from '@/components/ui/icon';
 import { PressableScale } from '@/components/ui/pressable-scale';
 import { PullToCloseScroll } from '@/components/ui/pull-to-close';
@@ -28,6 +29,18 @@ import { loadOfflinePass, saveOfflinePass } from '@/lib/offline-cache';
 import { currentCoords } from '@/lib/use-location';
 
 type Mode = 'scan' | 'pass';
+
+/**
+ * So lange steht die volle Karte, bevor sie sich zurücksetzt: die Feier (2,8 s,
+ * celebration.tsx) und ein Moment, um sie voll zu sehen.
+ */
+const NEXT_CARD_MS = 3400;
+
+/** War die gerade volle Karte eine goldene? Der Server schickt schon die neue Karte mit. */
+function justFilledGolden(card: CheckinResult['stamps']): boolean {
+  const every = card.golden_every ?? 5;
+  return card.completed_cards > 0 && card.completed_cards % every === 0;
+}
 
 /**
  * Einchecken beim Partner – auf beiden Wegen:
@@ -94,6 +107,16 @@ function ScanPanel({ bookingId, deepLinkToken }: { bookingId: number | null; dee
   /** Ein Scan wird genau einmal verarbeitet – der Scanner meldet denselben Code mehrfach pro Sekunde. */
   const handled = useRef(false);
   const [done, setDone] = useState(false);
+  /** Nach einer vollen Karte: Die neue (leere, vielleicht goldene) Karte ist jetzt dran. */
+  const [nextCardShown, setNextCardShown] = useState(false);
+  const fullCard = result !== null && result.reward_credits > 0;
+
+  // Die volle Karte steht, solange gefeiert wird; danach setzt sie sich zurück.
+  useEffect(() => {
+    if (!fullCard) return;
+    const timer = setTimeout(() => setNextCardShown(true), NEXT_CARD_MS);
+    return () => clearTimeout(timer);
+  }, [fullCard]);
 
   useEffect(() => {
     nfcState().then(setNfc);
@@ -137,13 +160,21 @@ function ScanPanel({ bookingId, deepLinkToken }: { bookingId: number | null; dee
     const input = { token: scanned, method, lat: coords?.lat ?? null, lng: coords?.lng ?? null };
     try {
       const { data } = await api.checkin(token, input);
+      setNextCardShown(false);
       setResult(data);
       setSticker(scanned);
       if (typeof data.credits === 'number') market.setCredits(data.credits);
       void market.refreshClub();
       // Volle Karte = der große Moment; ein einzelner Stempel landet auf der Karte selbst.
       if (data.reward_credits > 0) {
-        celebrate({ title: 'Stempelkarte voll!', credits: data.reward_credits, kind: 'coins', subtitle: 'Die Credits sind schon auf deinem Konto. Die neue Karte wartet.' });
+        celebrate({
+          title: justFilledGolden(data.stamps) ? 'Goldene Karte voll!' : 'Stempelkarte voll!',
+          credits: data.reward_credits,
+          kind: 'coins',
+          subtitle: data.stamps.golden
+            ? 'Die Credits sind schon auf deinem Konto. Deine nächste Karte ist golden!'
+            : 'Die Credits sind schon auf deinem Konto. Die neue Karte wartet.',
+        });
       } else if (data.stamped) feedback.achieved();
       else feedback.tapped();
       await settleTicket(data, scanned);
@@ -185,7 +216,15 @@ function ScanPanel({ bookingId, deepLinkToken }: { bookingId: number | null; dee
   };
 
   if (result) {
-    const freshIndex = result.stamped ? (result.stamps.filled === 0 ? result.stamps.fields - 1 : result.stamps.filled - 1) : null;
+    const card = result.stamps;
+    // Bei voller Karte zeigt der Server schon die neue. Erst steht die alte voll da
+    // (mit ihrem eigenen Gold), nach der Feier setzt sie sich zurück.
+    const showFull = fullCard && !nextCardShown;
+    const shownCard = showFull
+      ? { ...card, filled: card.fields, remaining: 0, golden: justFilledGolden(card), reward_credits: result.reward_credits, stamps: [] }
+      : card;
+    const freshIndex = !result.stamped ? null : showFull ? card.fields - 1 : card.filled > 0 ? card.filled - 1 : null;
+    const every = card.golden_every ?? 5;
     return (
       <View style={styles.panel}>
         <View style={styles.resultHead}>
@@ -195,7 +234,11 @@ function ScanPanel({ bookingId, deepLinkToken }: { bookingId: number | null; dee
           </Text>
           <Text style={[styles.resultText, { color: colors.textSecondary }]}>
             {result.reward_credits > 0
-              ? 'Deine Stempelkarte war voll – die Credits sind schon auf deinem Konto. Die neue Karte wartet.'
+              ? !nextCardShown
+                ? 'Deine Stempelkarte war voll – die Credits sind schon auf deinem Konto. Die neue Karte wartet.'
+                : card.golden
+                  ? `Deine neue Karte ist golden – voll bringt sie ${formatCredits(card.reward_credits)} Credits.`
+                  : `Neue Karte: noch ${card.remaining} bis ${formatCredits(card.reward_credits)} Credits. Jede ${every}. Karte ist golden.`
               : result.stamped
                 ? `Bei ${result.partner.name}. Noch ${result.stamps.remaining} bis ${result.stamps.reward_credits} Credits.`
                 : `Heute hast du bei ${result.partner.name} schon gestempelt – morgen gibt's den nächsten.`}
@@ -205,11 +248,10 @@ function ScanPanel({ bookingId, deepLinkToken }: { bookingId: number | null; dee
           ) : null}
         </View>
 
-        {/* Bei voller Karte zeigt die frische (leere) Karte nichts – dann die alte als voll. */}
-        <StampCard
-          card={result.reward_credits > 0 ? { ...result.stamps, filled: result.stamps.fields, remaining: 0 } : result.stamps}
-          freshIndex={freshIndex}
-        />
+        {/* Neuer Key beim Zurücksetzen: Die neue Karte tritt sichtbar ein. */}
+        <Entrance key={showFull ? 'full' : 'card'}>
+          <StampCard card={shownCard} freshIndex={freshIndex} />
+        </Entrance>
 
         {result.open_bookings.length > 0 && sticker ? (
           <Card style={styles.bookings}>

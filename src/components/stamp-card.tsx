@@ -399,6 +399,13 @@ export function StampCard({
   const fields = card.fields;
   const slotSize = compact ? 27 : 54;
   const foil: FoilKey = golden ? 'gold' : 'silver';
+  // Zwei feste Reihen (kompakt: eine). Mit flexWrap allein passten auf Handys ab 390 pt
+  // Breite sechs Felder in die erste Reihe – die Stempel lagen dort übereinander und
+  // unten blieben vier (gesehen Okt. 2026 im Reel).
+  const perRow = compact ? fields : Math.ceil(fields / 2);
+  const rows = Array.from({ length: Math.ceil(fields / perRow) }, (_, r) =>
+    Array.from({ length: Math.min(perRow, fields - r * perRow) }, (_, k) => r * perRow + k),
+  );
 
   // EIN Takt für die ganze Karte: Bei jedem Schlag funkelt genau ein Stempel, bei
   // jedem zweiten pocht einer. Vorher hatte jeder Stempel eigene Dauer-Glitzer,
@@ -473,30 +480,34 @@ export function StampCard({
       )}
 
       <View style={[styles.grid, compact && styles.gridCompact]}>
-        {Array.from({ length: fields }, (_, i) => {
-          const filled = i < card.filled;
-          return (
-            // Gestempelte Felder liegen oben: Der Stempel ist größer als sein Feld
-            // und überdeckt den Rand des Nachbarn – nicht umgekehrt.
-            <View key={i} style={[styles.slot, filled && styles.slotStamped, { width: slotSize, height: slotSize }]}>
-              <EmptySlot size={slotSize} number={i + 1} reward={i === fields - 1} underStamp={filled} />
-              {filled ? (
-                <View style={styles.stampOnTop} pointerEvents="none">
-                  <HoloStamp
-                    size={stampSize(slotSize)}
-                    index={i}
-                    entry={card.stamps[i] ?? null}
-                    fresh={freshIndex === i}
-                    foil={foil}
-                    beat={beat}
-                    count={filledCount}
-                    shine={!compact && i === filledCount - 1}
-                  />
+        {rows.map((row, r) => (
+          <View key={r} style={styles.row}>
+            {row.map((i) => {
+              const filled = i < card.filled;
+              return (
+                // Gestempelte Felder liegen oben: Der Stempel ist größer als sein Feld
+                // und überdeckt den Rand des Nachbarn – nicht umgekehrt.
+                <View key={i} style={[styles.slot, filled && styles.slotStamped, { width: slotSize, height: slotSize }]}>
+                  <EmptySlot size={slotSize} number={i + 1} reward={i === fields - 1} underStamp={filled} />
+                  {filled ? (
+                    <View style={styles.stampOnTop} pointerEvents="none">
+                      <HoloStamp
+                        size={stampSize(slotSize)}
+                        index={i}
+                        entry={card.stamps[i] ?? null}
+                        fresh={freshIndex === i}
+                        foil={foil}
+                        beat={beat}
+                        count={filledCount}
+                        shine={!compact && i === filledCount - 1}
+                      />
+                    </View>
+                  ) : null}
                 </View>
-              ) : null}
-            </View>
-          );
-        })}
+              );
+            })}
+          </View>
+        ))}
       </View>
 
     </View>
@@ -527,8 +538,9 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
   },
   cardsDoneText: { color: '#fff1a8', fontFamily: FontFamily.bold, fontSize: 12 },
-  grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: Spacing.three, paddingBottom: Spacing.one },
-  gridCompact: { flexWrap: 'nowrap', rowGap: 0, paddingBottom: 0 },
+  grid: { gap: Spacing.three, paddingBottom: Spacing.one },
+  gridCompact: { gap: 0, paddingBottom: 0 },
+  row: { flexDirection: 'row', justifyContent: 'space-between' },
   slot: { alignItems: 'center', justifyContent: 'center' },
   slotStamped: { zIndex: 1 },
   /** Der Stempel liegt über dem Feld – mit seinem eigenen Versatz (stamp-scatter.ts). */
