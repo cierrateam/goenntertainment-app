@@ -15,7 +15,7 @@
 import { Image } from 'expo-image';
 import { Stack, useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View, type ScrollViewInstance } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { MascotEmpty, MascotError } from '@/components/mascot';
@@ -59,7 +59,7 @@ export default function ChatScreen() {
   const [menuFor, setMenuFor] = useState<ChatMessage | null>(null);
   const [reporting, setReporting] = useState<{ id: number; label: string } | null>(null);
 
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useRef<ScrollViewInstance>(null);
   const cursor = useRef(0);
   const polling = useRef(false);
 

@@ -400,7 +400,9 @@ function TabPane({ index, name, focused, children }: { index: number; name: stri
 
 /* ============================================================ Leiste */
 
-function TabButton({ tab, isFocused, onPress, ...props }: TabTriggerSlotProps & { tab: TabDef }) {
+// Ohne `ref`: TabTrigger reicht keins durch, und expo-router tippt es noch auf den alten
+// Klassen-Typ von `View` – an `Pressable` (RN 0.88, strikte Typen) passt das nicht mehr.
+function TabButton({ tab, isFocused, onPress, ...props }: Omit<TabTriggerSlotProps, 'ref'> & { tab: TabDef }) {
   const colors = useTheme();
   const market = useMarket();
   const color = isFocused ? colors.tint : colors.textSecondary;

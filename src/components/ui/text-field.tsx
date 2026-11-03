@@ -9,7 +9,9 @@ import {
   type BlurEvent,
   type FocusEvent,
   type StyleProp,
+  type TextInputInstance,
   type TextInputProps,
+  type ViewInstance,
   type ViewStyle,
 } from 'react-native';
 
@@ -67,7 +69,7 @@ export type TextFieldProps = TextInputProps & {
  * Container bleibt das wirkungslos, das Feld funktioniert aber trotzdem.
  */
 export const TextField = memo(
-  forwardRef<TextInput, TextFieldProps>(function TextField(
+  forwardRef<TextInputInstance, TextFieldProps>(function TextField(
     {
       label,
       error,
@@ -93,7 +95,7 @@ export const TextField = memo(
 
     // `collapsable={false}`: sonst faltet Android die reine Layout-View weg und
     // `measureInWindow` liefert keine brauchbaren Koordinaten mehr.
-    const wrapper = useRef<View>(null);
+    const wrapper = useRef<ViewInstance>(null);
 
     const borderColor = error ? SIGNAL_ERROR : focused ? surface.accent : surface.fieldBorder;
 

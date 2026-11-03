@@ -82,7 +82,11 @@
         {
           "nfcPermission": "Damit du dein Handy zum Einchecken an den GÖ4Fun-Aufkleber eines Partners halten kannst."
         }
-      ]
+      ],
+      "expo-font",
+      "expo-image",
+      "expo-status-bar",
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true,

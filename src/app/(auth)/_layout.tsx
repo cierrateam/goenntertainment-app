@@ -17,6 +17,8 @@ export default function AuthLayout() {
       <Stack
         screenOptions={{
           headerShown: false,
+          // Wie im äußeren Stack: SDK 58 macht den Kopf auf iOS 26+ sonst durchsichtig.
+          headerTransparent: false,
           headerBackTitle: 'Zurück',
           headerBackButtonDisplayMode: 'default',
           header: renderAppHeader,

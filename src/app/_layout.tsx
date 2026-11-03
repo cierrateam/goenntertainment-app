@@ -45,9 +45,13 @@ function RootNavigator({ fontsReady }: { fontsReady: boolean }) {
     // runder Zurück-Knopf statt System-Pfeil, überall gleich (app-header.tsx).
     // `animation`: Jeder neue Screen schiebt sich von rechts herein – auf iOS UND
     // Android gleich; Zurückwischen geht über die ganze Breite.
+    // `headerTransparent: false`: Seit SDK 58 ist der Kopf auf iOS 26+ von sich aus
+    // durchsichtig; der Inhalt rutschte dann unter AppHeader. Screens über einem Bild
+    // schalten ihn weiter selbst ein.
     <Stack
       screenOptions={{
         headerShown: false,
+        headerTransparent: false,
         headerBackTitle: 'Zurück',
         headerBackButtonDisplayMode: 'default',
         header: renderAppHeader,
