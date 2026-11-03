@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "goenntertainment-app",
+    "name": "Goe4FUN",
     "slug": "goenntertainment-app",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -10,7 +10,10 @@
     "ios": {
       "icon": "./assets/images/icon.png",
       "bundleIdentifier": "de.goenntertainment.app",
-      "supportsTablet": false
+      "supportsTablet": false,
+      "config": {
+        "usesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "de.goenntertainment.app",
