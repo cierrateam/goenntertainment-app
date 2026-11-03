@@ -20,7 +20,9 @@ nicht die eines VPN- oder virtuellen Adapters und nicht `127.0.0.1`.
 Lies `.env.local` im Projekt-Root, Zeile `EXPO_PUBLIC_API_URL=`.
 - IP weicht ab → im Bericht die richtige Zeile nennen: `EXPO_PUBLIC_API_URL=http://<WLAN-IP>:8000`.
 - Datei fehlt → im Bericht: `.env.example` nach `.env.local` kopieren und diese Zeile eintragen.
-- Steht dort eine `https://…`-Adresse (Tunnel), ist das Absicht → nicht ändern, in Schritt 5 diese Adresse prüfen.
+- Steht dort eine `https://…`-Adresse (Normalfall: der Server `https://goe4fun.de`), ist das Absicht → nicht
+  ändern, in Schritt 5 statt der WLAN-IP `curl -s -m 5 <Adresse>/api/health` prüfen. Die WLAN-IP ist dann nur
+  für Metro (Expo Go) wichtig, nicht fürs Backend.
 
 ## 4. Backend lokal
 `curl -s -m 3 http://127.0.0.1:8000/api/health` — erwartet `{"ok":true}`.

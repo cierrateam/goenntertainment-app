@@ -75,6 +75,7 @@ $ip = if ($pick) { $pick.IPAddress } else { $null }
 
 $envChanged = $false
 $envNote = ''
+$keepRemote = $false
 
 if ($ip) {
     $wanted = "http://${ip}:8000"
@@ -91,13 +92,17 @@ if ($ip) {
     }
     $current = if ($activeIndex -ge 0) { ($lines[$activeIndex] -split '=', 2)[1].Trim() } else { '' }
 
-    # Eine https-Adresse ist ein Tunnel (cloudflared) – also Absicht: App soll
-    # WLAN-unabhängig laufen. Die bleibt, solange der Tunnel lebt. Nach einem
-    # Neustart ist die Wegwerf-Tunnel-Adresse aber tot, dann zurück aufs WLAN.
-    $keepTunnel = $current -like 'https://*' -and (Test-Health "$current/api/health" 5)
+    # Eine https-Adresse ist Absicht: Die App soll WLAN-unabhängig laufen.
+    # Der Server unter der eigenen Domain (https://goe4fun.de) bleibt immer stehen –
+    # auch wenn er beim Hochfahren gerade nicht antwortet. Nur eine Wegwerf-Adresse
+    # von `cloudflared tunnel --url` (*.trycloudflare.com) ist nach einem Neustart
+    # tot, dann zurück aufs WLAN.
+    $isHttps = $current -like 'https://*'
+    $isQuickTunnel = $current -match '^https://[^/]+\.trycloudflare\.com(/|$)'
+    $keepRemote = $isHttps -and (-not $isQuickTunnel -or (Test-Health "$current/api/health" 5))
 
-    if ($keepTunnel) {
-        $envNote = "Tunnel aktiv ($current) – WLAN-IP nicht eingetragen"
+    if ($keepRemote) {
+        $envNote = "$current (Server, WLAN-IP nicht eingetragen)"
     } elseif ($current -ne $wanted) {
         $new = [System.Collections.Generic.List[string]]::new()
         foreach ($line in $lines) {
@@ -184,6 +189,8 @@ function Mark([bool]$v) {
 
 $laravel = Test-Health 'http://127.0.0.1:8000/api/health'
 $lan = if ($ip) { Test-Health "http://${ip}:8000/api/health" } else { $false }
+# Zeigt die App auf den Server, zählt dessen Antwort statt der WLAN-Strecke zum PC.
+$remote = if ($keepRemote) { Test-Health "$current/api/health" 5 } else { $false }
 $metro = Test-Port 8081
 
 $report = @(
@@ -192,13 +199,13 @@ $report = @(
     "$(Mark ([bool]$ip)) .env.local: $envNote",
     "$(Mark $mysqlUp) MySQL (3306)",
     "$(Mark $laravel) Laravel-API (8000)",
-    "$(Mark $lan) Backend übers WLAN erreichbar",
+    $(if ($keepRemote) { "$(Mark $remote) Backend $current erreichbar" } else { "$(Mark $lan) Backend übers WLAN erreichbar" }),
     "$(Mark $metro) Expo/Metro (8081)"
 )
 if ($started.Count -gt 0) { $report += "Gestartet: $($started -join ', ')" }
 if ($ip) { $report += "Expo Go: exp://${ip}:8081" }
 if (-not $mysqlUp) { $report += 'MySQL läuft nicht – in Herd/Dienste starten, sonst antwortet kein Backend.' }
-if ($laravel -and -not $lan -and $ip) {
+if ($laravel -and -not $lan -and $ip -and -not $keepRemote) {
     $report += 'Lokal ok, übers WLAN nicht -> Firewall (Admin-PowerShell): New-NetFirewallRule -DisplayName "Goenntertainment Backend 8000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8000 -Profile Private'
 }
 

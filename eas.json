@@ -20,7 +20,7 @@
         "simulator": false
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://BITTE-OEFFENTLICHE-URL-EINTRAGEN.invalid"
+        "EXPO_PUBLIC_API_URL": "https://goe4fun.de"
       }
     },
     "production": {
@@ -29,7 +29,7 @@
         "buildType": "app-bundle"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://BITTE-OEFFENTLICHE-URL-EINTRAGEN.invalid"
+        "EXPO_PUBLIC_API_URL": "https://goe4fun.de"
       }
     }
   }
