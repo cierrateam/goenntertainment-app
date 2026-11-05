@@ -30,7 +30,7 @@
 # hand: `docker buildx imagetools inspect <name>:<tag>` prints the current one; every copy of a
 # pin moves in the same change.
 
-FROM mlocati/php-extension-installer:2@sha256:1afade3e29cfc97362cf5885e5ac333bf2faab1146cb28ebbb59b17e68f87e88 AS php-ext-installer
+FROM mlocati/php-extension-installer:2@sha256:4fd45396c16685266d32bf147a24ecd5e81029d3820295895bf4a90131190ac9 AS php-ext-installer
 FROM composer:2@sha256:af98f42dfff7c68ba8d53c2164fd9fde1087b7d449514baa38c418b1f6bc4bac AS composer-bin
 
 # ================================================================ base
