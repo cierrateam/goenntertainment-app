@@ -10,19 +10,19 @@ import Constants from 'expo-constants';
  *
  * Warum? Eine hier verdrahtete WLAN-IP fesselt die App ans Heimnetz: Ein
  * fertiges APK mit `192.168.178.x` läuft nur, solange das Handy in derselben
- * Fritzbox hängt, und ist unterwegs auf Mobilfunk tot. Über die Variable zeigt
- * der Dev-Betrieb weiter auf die LAN-IP, der Build dagegen auf eine öffentliche
- * Adresse (Cloudflare-Tunnel, später die eigene Domain) – ohne dass an dieser
- * Datei eine Zeile geändert werden muss.
+ * Fritzbox hängt, und ist unterwegs auf Mobilfunk tot. Über die Variable zeigen
+ * Dev-Betrieb und Build auf den Server unter der eigenen Domain
+ * (`https://goe4fun.de`); wer API-Änderungen am eigenen PC testet, trägt in
+ * `.env.local` vorübergehend die LAN-IP ein – ohne dass an dieser Datei eine
+ * Zeile geändert werden muss.
  *
  * WICHTIG: `process.env.EXPO_PUBLIC_API_URL` muss genau so ausgeschrieben
  * dastehen. Metro ersetzt diesen Ausdruck beim Bündeln durch den Wert; ein
  * Umweg wie `process.env['EXPO_PUBLIC_API_URL']` oder Destrukturieren wird
  * NICHT ersetzt und ist im Build `undefined`.
  *
- * Ändert sich die WLAN-IP (neuer DHCP-Lease), gehört die neue in `.env.local` –
- * der Slash-Befehl `/wlan` macht genau das. Danach Metro neu laden (`r`), sonst
- * steckt der alte Wert noch im Bundle.
+ * Nach einer Änderung an `.env.local` Metro neu starten, sonst steckt der alte
+ * Wert noch im Bundle.
  */
 const CONFIGURED_API_URL = process.env.EXPO_PUBLIC_API_URL?.trim().replace(/\/+$/, '');
 
@@ -55,7 +55,7 @@ if (__DEV__ && !CONFIGURED_API_URL) {
   // der Fehler zeigt sich erst als hängender Login.
   console.warn(
     `[config] EXPO_PUBLIC_API_URL ist nicht gesetzt – geraten wird ${API_BASE_URL}. ` +
-      'Trag die WLAN-IP in .env.local ein (Vorlage: .env.example) oder nutze /wlan.',
+      'Trag https://goe4fun.de in .env.local ein (Vorlage: .env.example).',
   );
 }
 

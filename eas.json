@@ -20,7 +20,7 @@
         "simulator": false
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://BITTE-OEFFENTLICHE-URL-EINTRAGEN.invalid"
+        "EXPO_PUBLIC_API_URL": "https://goe4fun.de"
       }
     },
     "production": {
@@ -29,7 +29,18 @@
         "buildType": "app-bundle"
       },
       "env": {
-        "EXPO_PUBLIC_API_URL": "https://BITTE-OEFFENTLICHE-URL-EINTRAGEN.invalid"
+        "EXPO_PUBLIC_API_URL": "https://goe4fun.de"
+      },
+      "distribution": "store"
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "ascApiKeyPath": "${EXPO_ASC_API_KEY_PATH}",
+        "ascApiKeyId": "${EXPO_ASC_KEY_ID}",
+        "ascApiKeyIssuerId": "${EXPO_ASC_ISSUER_ID}",
+        "appleTeamId": "Z833B3B9U2"
       }
     }
   }

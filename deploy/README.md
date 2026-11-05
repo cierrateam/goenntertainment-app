@@ -489,14 +489,15 @@ steps 6 and 7.
 ## The app build
 
 The app finds the server through `EXPO_PUBLIC_API_URL`, baked into the build. In
-[`eas.json`](../eas.json), replace the placeholder in **both** profiles (`preview` and
-`production`) with the server's address:
+[`eas.json`](../eas.json), **both** profiles (`preview` and `production`) carry the server's
+address:
 
 ```json
-"env": { "EXPO_PUBLIC_API_URL": "https://<DOMAIN>" }
+"env": { "EXPO_PUBLIC_API_URL": "https://goe4fun.de" }
 ```
 
-Without it the build is useless: the app shows only a timeout when signing in. Who owns the EAS
+If the domain changes, change it in both profiles and build again. A wrong address makes the
+build useless: the app shows only a timeout when signing in. Who owns the EAS
 project and builds the app: `______` (whoever is accountable for the app, to be named before
 go-live).
 

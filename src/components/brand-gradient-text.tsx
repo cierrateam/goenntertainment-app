@@ -1,8 +1,13 @@
-import MaskedView from '@react-native-masked-view/masked-view';
+import MaskedViewNative from '@react-native-masked-view/masked-view';
 import { LinearGradient } from 'expo-linear-gradient';
-import { Platform, StyleSheet, Text, type TextProps } from 'react-native';
+import type { ComponentType, ReactElement } from 'react';
+import { Platform, StyleSheet, Text, type TextProps, type ViewProps } from 'react-native';
 
 import { Brand, BrandGradient } from '@/constants/theme';
+
+// Die Typen von masked-view 0.3.2 erben von `NativeMethods`, das React Native seit 0.88
+// (strikte Typen) nicht mehr exportiert – zur Laufzeit ist die Komponente unverändert.
+const MaskedView = MaskedViewNative as unknown as ComponentType<ViewProps & { maskElement: ReactElement }>;
 
 /**
  * Text im Marken-Verlauf (Lila → Pink), wie `brand-gradient-text` im Web.

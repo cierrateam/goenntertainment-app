@@ -36,9 +36,11 @@ app (`src/`) on a Laravel API (`api/`); production runs with Docker (`deploy/`).
    npx expo start
    ```
 
-If the app shows "Keine Verbindung zum Server", Laravel from step 2 is not running, or the
-phone cannot reach it: the app takes the address from `EXPO_PUBLIC_API_URL` in `.env.local`
-(template: [`.env.example`](.env.example), see [`src/constants/config.ts`](src/constants/config.ts)).
+The app takes the backend address from `EXPO_PUBLIC_API_URL` in `.env.local` (template:
+[`.env.example`](.env.example), see [`src/constants/config.ts`](src/constants/config.ts)). By
+default that is the server, `https://goe4fun.de`; to try API changes from step 2 on a phone,
+put this PC's LAN address there instead (`http://<LAN-IP>:8000`) and restart Metro. If the app
+shows "Keine Verbindung zum Server", the address in `.env.local` does not answer.
 
 In the output, you'll find options to open the app in a
 
@@ -147,7 +149,7 @@ prefix of their own.
 
 ## Further reading
 
-- [Expo SDK 57 documentation](https://docs.expo.dev/versions/v57.0.0/) – the version this app is
+- [Expo SDK 58 documentation](https://docs.expo.dev/versions/v58.0.0/) – the version this app is
   built on ([`AGENTS.md`](AGENTS.md)).
 - [`api/README.md`](api/README.md) – the Laravel API; [`deploy/README.md`](deploy/README.md) – the
   production setup.

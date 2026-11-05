@@ -1,6 +1,6 @@
 import { BlurTargetView } from 'expo-blur';
 import type { ReactNode, RefObject } from 'react';
-import { StyleSheet, View, type ViewProps } from 'react-native';
+import { StyleSheet, View, type ViewInstance, type ViewProps } from 'react-native';
 
 import { Palette } from '@/constants/theme';
 import { useResolvedScheme } from '@/lib/theme-preference';
@@ -20,7 +20,7 @@ type HomeBackgroundProps = ViewProps & {
    * SDK 55 zeichnet Android nur noch weich, was in einem `BlurTargetView`
    * liegt – ohne dieses Ziel bliebe vom Glas nur die Tönung übrig.
    */
-  blurTarget?: RefObject<View | null>;
+  blurTarget?: RefObject<ViewInstance | null>;
   /**
    * Liegt über der Leinwand, aber AUSSERHALB des Blur-Ziels. Hierhin gehört
    * das Glas selbst (das Konto-Blatt): Läge es im Ziel, müsste es sich selbst

@@ -6,6 +6,7 @@ import {
   type LayoutChangeEvent,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
+  type ScrollViewInstance,
   type StyleProp,
   type ViewStyle,
 } from 'react-native';
@@ -51,7 +52,7 @@ export function Rail({
   hintHeight,
   contentStyle,
 }: Props) {
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useRef<ScrollViewInstance>(null);
   const step = itemWidth + gap;
 
   // Wohin lässt sich noch wischen? Die Maße liegen in einem Ref, damit das

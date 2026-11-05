@@ -7,7 +7,9 @@ import {
   type KeyboardEvent,
   type NativeScrollEvent,
   type NativeSyntheticEvent,
+  type ScrollViewInstance,
   type ScrollViewProps,
+  type ViewInstance,
   type LayoutChangeEvent,
 } from 'react-native';
 
@@ -53,13 +55,13 @@ export function KeyboardForm({
   onLayout,
   ...rest
 }: KeyboardFormProps) {
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useRef<ScrollViewInstance>(null);
   /** Aktueller Scrollstand – für die Umrechnung „um wie viel muss ich schieben". */
   const scrollY = useRef(0);
   /** Oberkante der Tastatur in Bildschirmkoordinaten, `null` = zu. */
   const keyboardTop = useRef<number | null>(null);
   /** Feld, das gerade den Fokus bekommen hat (wartet ggf. auf die Tastatur). */
-  const awaiting = useRef<View | null>(null);
+  const awaiting = useRef<ViewInstance | null>(null);
   const [inset, setInset] = useState(0);
 
   /**
@@ -68,7 +70,7 @@ export function KeyboardForm({
    * vergleichbar, ohne Scrollstand oder Fensterhöhe einzurechnen.
    */
   const reveal = useCallback(
-    (node: View | null) => {
+    (node: ViewInstance | null) => {
       const top = keyboardTop.current;
       const scroll = scrollRef.current;
       if (!node || !scroll || top == null) return;
